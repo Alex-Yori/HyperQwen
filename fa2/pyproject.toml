@@ -19,3 +19,6 @@ py-modules = ["fa2_prefill", "paged_prefill"]
 
 [tool.setuptools.package-dir]
 "" = "python"
+
+[tool.setuptools.package-data]
+fa2_fp8kv_vllm = ["*.so"]
