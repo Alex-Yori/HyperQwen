@@ -45,6 +45,8 @@ jobs:
         run: bash bench/test_bool_knobs.sh
       - name: Check the dflash2 seat note against the measured pools and resident counts
         run: bash bench/test_resident_print.sh
+      - name: Check FA2_FP8KV selects fp8 on FLASH_ATTN only on SPEC=dflash2 CTX=long and refuses the rest
+        run: bash bench/test_fa2_fp8kv_knob.sh
 
   kvarn-torch-gate:
     runs-on: ubuntu-latest
