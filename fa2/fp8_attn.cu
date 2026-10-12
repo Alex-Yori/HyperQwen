@@ -39,7 +39,7 @@ void launch(fa2_fp8kv_kernel::Flash_fwd_params& params, cudaStream_t stream) {
     kernel<<<grid, Traits::kNThreads, Traits::kSmemSize, stream>>>(params);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     if constexpr (Split) {
-        const dim3 combine((params.b * params.h * params.seqlen_q + 3) / 4);
+        const dim3 combine((int64_t(params.b) * params.h * params.seqlen_q + 3) / 4);
         fa2_fp8kv_kernel::flash_fwd_splitkv_combine_kernel<Traits, 4, 7, true>
             <<<combine, Traits::kNThreads, 0, stream>>>(params);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
