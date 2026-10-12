@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP8 E4M3 extension using FlashAttention metadata and KV-cache storage."""
 from dataclasses import dataclass
-import os
 from typing import ClassVar
 
 import torch
+from fa2_fp8kv_vllm import paths
 from fa2_prefill import Fa2Prefill
 from paged_prefill import PagedPrefill
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionImpl, AttentionType
 from vllm.v1.attention.backends import flash_attn as native
@@ -19,9 +19,9 @@ def extension_selected(cache_dtype):
             and cache_dtype in ("fp8", "fp8_e4m3"))
 
 
-if current_platform.get_device_capability() in ((8, 6), (8, 9), (12, 0)):
-    torch.ops.load_library(os.environ["FA2_FP8KV_LIBRARY"])
-    torch.ops.load_library(os.environ["FA2_FP8KV_PREFILL_LIBRARY"])
+if paths.enabled() and current_platform.get_device_capability() in ((8, 6), (8, 9), (12, 0)):
+    torch.ops.load_library(str(paths.library()))
+    torch.ops.load_library(str(paths.prefill_library()))
 
 
 @dataclass
@@ -145,7 +145,13 @@ class Fp8FlashAttentionBackend(native.FlashAttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls):
-        return (KVCacheLayout.LBNHC,)
+        # The engine asks the workers for layouts outside set_current_vllm_config. Without a
+        # config only the FA2_FP8KV gate, which selected this backend, is known: treat it as fp8.
+        config = get_current_vllm_config_or_none()
+        cache_dtype = config.cache_config.cache_dtype if config else "fp8"
+        if extension_selected(cache_dtype):
+            return (KVCacheLayout.LBNHC,)
+        return super().supported_kv_cache_layouts()
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype):
