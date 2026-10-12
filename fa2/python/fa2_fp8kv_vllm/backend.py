@@ -14,12 +14,16 @@ from vllm.v1.attention.backends import flash_attn as native
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 
+# install.sh builds sm_86 only. That cubin also runs on sm_89 (same major); sm_120 would need its own build.
+BUILT_FOR = ((8, 6), (8, 9))
+
+
 def extension_selected(cache_dtype):
-    return (current_platform.get_device_capability() in ((8, 6), (8, 9), (12, 0))
+    return (current_platform.get_device_capability() in BUILT_FOR
             and cache_dtype in ("fp8", "fp8_e4m3"))
 
 
-if paths.enabled() and current_platform.get_device_capability() in ((8, 6), (8, 9), (12, 0)):
+if paths.enabled() and current_platform.get_device_capability() in BUILT_FOR:
     torch.ops.load_library(str(paths.library()))
     torch.ops.load_library(str(paths.prefill_library()))
 

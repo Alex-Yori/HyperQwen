@@ -68,6 +68,7 @@ for dtype in ("fp8", "fp8_e4m3"):
 for dtype in ("auto", "bfloat16", "float16"):
     check(layouts(dtype) is None, f"{dtype} keeps the native any-layout answer")
 check(layouts("fp8", capability=(8, 0)) is None, "fp8 on sm80 is not this backend's")
+check(layouts("fp8", capability=(12, 0)) is None, "fp8 on sm120: not built for it")
 check(layouts("fp8", capability=None) is None, "no GPU: not selected")
 check(layouts(None, config=False) == (KVCacheLayout.LBNHC,), "no config (engine RPC): the gate decides, LBNHC")
 
