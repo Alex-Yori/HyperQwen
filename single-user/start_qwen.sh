@@ -278,10 +278,14 @@ fi
 # The DFlash2 drafter's five layers are sliding-window and non-causal, which the kernel does not serve
 # (gotcha 63), so its speculative config gets no attention_backend and stays the arm's own, byte for
 # byte: the drafter autoselects TRITON_ATTN, as it does without the knob. VLLM_SPEC_DECODE_ATTN stays as
-# the arm sets it; it reaches only the Triton impl, whose split-KV verify gate skips the drafter's
-# windowed layers (patches/spec-decode-int8-kv.patch). Capped 2x RTX 3080 20 GB at TP=2, vLLM 0.31.0,
-# against TRITON_ATTN on the same cache: 128k TTFT 123.7 s against 251.7 s, N=1 decode at 128k 106.7
-# against 58.3 tok/s, accepted length 4.81 of 7 drafts on both, GSM8K 0.965 against 0.955.
+# the arm sets it; on this arm only the drafter's Triton impl reads it, and its split-KV verify gate
+# skips the drafter's windowed layers (patches/spec-decode-int8-kv.patch). Only the measured drafting
+# setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or dflash), DFLASH_TOKENS unset or 7, and
+# LOOKUP unset or 1; anything else on this arm is refused. Capped 2x RTX 3080 20 GB at TP=2, vLLM
+# 0.31.0, against TRITON_ATTN on the same cache: 128k TTFT 123.7 s against 251.7 s, N=1 decode at 128k
+# 106.7 against 58.3 tok/s, accepted length 4.81 of 7 drafts on both, GSM8K 0.965 against 0.955.
+# Provisional: those rows are from an earlier sitting (2026-10-14) on the image of the branch this one
+# is cut from, with a launcher giving this argv; they are to be replaced by this branch's own image.
 PTH_FA=${PTH_FA:-0}
 PTH_SPEC_BACKEND=
 if [ "$PTH_FA" = 1 ]; then
@@ -292,6 +296,29 @@ if [ "$PTH_FA" = 1 ]; then
       echo "  refusing rather than booting an arm it was not measured on. Unset PTH_FA, or set one of those." >&2
       exit 1 ;;
   esac
+  if [ "${FA2_FP8KV:-0}" = 1 ]; then
+    echo "PTH_FA=1 and FA2_FP8KV=1 both pick the dflash2 backend (the int8 kernel against the FA2 fp8 port);" >&2
+    echo "  refusing rather than mixing them. Set one of the two." >&2
+    exit 1
+  fi
+  if [ "$SPEC" = dflash2 ]; then
+    if [ "${DRAFT_METHOD:-dflash}" != dflash ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with the DFlash2 drafter only; DRAFT_METHOD=$DRAFT_METHOD is a" >&2
+      echo "  different drafter, untested next to this backend. Unset DRAFT_METHOD, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ "${DFLASH_TOKENS:-7}" != 7 ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured at DFLASH_TOKENS=7 (an 8-token verify block); DFLASH_TOKENS=$DFLASH_TOKENS" >&2
+      echo "  changes the target's verify block (and above 7 makes its length adaptive), untested on this backend." >&2
+      echo "  Unset DFLASH_TOKENS, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ "${LOOKUP:-1}" != 1 ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with lookup drafting on; LOOKUP=$LOOKUP is untested on this" >&2
+      echo "  backend. Unset LOOKUP, or PTH_FA." >&2
+      exit 1
+    fi
+  fi
   case " ${EXTRA_ARGS:-} " in
     *" --attention-backend"*|*" --kv-cache-dtype"*|*" --speculative-config"*)
       echo "PTH_FA=1 sets --attention-backend, --kv-cache-dtype and the speculative config itself;" >&2
@@ -315,7 +342,7 @@ sys.exit(0 if s and os.path.isfile(os.path.join(s.submodule_search_locations[0],
     echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and MTP drafter" >&2
   else
     echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target only; the DFlash2" >&2
-    echo "  drafter stays on TRITON_ATTN (autoselected): its sliding-window, non-causal layers are outside the kernel" >&2
+    echo "  drafter is left to vLLM's autoselect (TRITON_ATTN): its sliding-window, non-causal layers are outside the kernel" >&2
   fi
 elif [ "$PTH_FA" != 0 ]; then
   echo "PTH_FA=$PTH_FA: set it to 0 or 1" >&2

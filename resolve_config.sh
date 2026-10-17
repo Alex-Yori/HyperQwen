@@ -139,7 +139,7 @@ resolve_effective_config() {
       local _pth_on=
       case "$spec/$ctx" in
         mtp/long) _pth_on=": target and MTP drafter" ;;
-        dflash2/long) _pth_on=": target only, the DFlash2 drafter stays on TRITON_ATTN" ;;
+        dflash2/long) _pth_on=": target only, the DFlash2 drafter on TRITON_ATTN (autoselected)" ;;
       esac
       echo "[effective-config] PTH_FA=1 (int8_per_token_head KV on the CUSTOM backend, pthfa/$_pth_on)"
     fi

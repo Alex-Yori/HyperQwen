@@ -241,9 +241,11 @@ drafter takes its backend from there, not from `--attention-backend`. `PTH_FA=1`
 layer reads the same cache with the same kernel. Decode and verify batches are captured FULL (the backend
 declares uniform-batch graphs) with vLLM's default mode; nothing else in the argv changes
 (`bench/test_pthfa_knob.sh` checks it). `VLLM_SPEC_DECODE_ATTN` is not read on this route: on vLLM 0.31.0
-only `FLASH_ATTN` reads it. Refused at startup: any other `SPEC`/`CTX`, `--attention-backend`,
-`--kv-cache-dtype` or `--speculative-config` in `EXTRA_ARGS`, a KV offload tier (untested on this
-backend), a venv without the package. Limits are gotcha 63.
+the `FLASH_ATTN` and `TRITON_ATTN` impls read it (`patches/spec-decode-attn.patch`,
+`patches/spec-decode-int8-kv.patch`), and here both models run `CUSTOM`. Refused at startup: any other
+`SPEC`/`CTX`, `--attention-backend`, `--kv-cache-dtype` or `--speculative-config` in `EXTRA_ARGS`, a KV
+offload tier (untested on this backend), a venv without the package, `FA2_FP8KV=1` alongside it. Limits
+are gotcha 63.
 
 **Measured on two RTX 3080 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090.**
 Linux in a Proxmox LXC container, driver 615.71.09, PCIe without P2P (`NCCL_P2P_DISABLE=1`,
@@ -332,13 +334,16 @@ leaving it out lets vLLM autoselect `TRITON_ATTN` for the drafter exactly as on 
 naming `CUSTOM` there would stop the boot at the drafter's layers. The boot log shows both selections:
 `Using AttentionBackendEnum.CUSTOM backend` for the target on each rank, then
 `Using TRITON_ATTN attention backend out of potential backends: ['TRITON_ATTN']` for the drafter.
-`VLLM_SPEC_DECODE_ATTN` stays the arm's 1: it reaches only the Triton impl, where the split-KV verify
-gate skips the drafter's windowed layers (`patches/spec-decode-int8-kv.patch`), so it changes nothing
-here. Nothing else in the argv or the environment changes (`bench/test_pthfa_knob.sh` checks it), and
-the refusals are the mtp arm's: `--attention-backend`, `--kv-cache-dtype` or `--speculative-config` in
-`EXTRA_ARGS`, a KV offload tier, a venv without the package.
+`VLLM_SPEC_DECODE_ATTN` stays the arm's 1: on this arm only the drafter's Triton impl reads it, and its
+split-KV verify gate skips the drafter's windowed layers (`patches/spec-decode-int8-kv.patch`), so it
+changes nothing here. Nothing else in the argv or the environment changes (`bench/test_pthfa_knob.sh`
+checks it). Refused at startup, besides the mtp arm's refusals: a drafting setup other than the measured
+one, i.e. `DRAFT_METHOD` other than `dflash` (DSpark is another drafter), `DFLASH_TOKENS` other than 7
+(it changes the target's verify block, and above 7 makes its length adaptive), and `LOOKUP=0`. `VISION=1`
+is accepted and untested on this arm (gotcha 63).
 
-**Measured on two RTX 3080 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090.** Capped
+**Measured on two RTX 3080 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090:** the
+same box as above (Linux in a Proxmox LXC container, driver 615.71.09, PCIe without P2P). Capped
 state (220 W, 1905 MHz lock), vLLM 0.31.0, the default DFlash2 target (`Qwen3.8-27B-W4A16-AutoRound-fast`)
 and drafter (`Qwen3.8-27B-DFlash2-W4A16`), text-only, k=7 with lookup drafting on, `PREFIX_CACHE=1
 MAX_SEQS=2 MAX_LEN=262144 GPU_UTIL=0.94 NCCL_P2P_DISABLE=1` and
@@ -351,7 +356,7 @@ Distinct 8k / 32k / 128k prompts, 256 tokens out, greedy; medians of 3 reps (8k:
 the row says n, 95% CI of the ratio in brackets. `main`'s arm, repeated last, read within about 1.5% of
 itself on every median:
 
-| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | `TRITON_ATTN` (int8) | `FLASH_ATTN` fp8 (FA2 port) | `CUSTOM` target (int8, `PTH_FA=1`) | `CUSTOM` / `TRITON_ATTN` |
+| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | `TRITON_ATTN` (int8) | `FLASH_ATTN` fp8 (FA2 port) | `CUSTOM` target (int8, `PTH_FA=1` argv; earlier image, 2026-10-14) | `CUSTOM` / `TRITON_ATTN` |
 |---|---|---|---|---|
 | TTFT 128k cold (n=1) / 32k warm (n=5) / 8k warm (n=7) | 251.7 / 31.30 / 6.01 s | 114.8 / 22.96 / 5.48 s | 123.7 / 23.46 / 5.51 s | 0.491 / 0.750 [0.60-0.89] / 0.916 [0.913-0.918] |
 | 1 stream decode at 128k / 32k / 8k | 58.3 / 101.0 / 136.1 tok/s | 81.4 / 111.5 / 134.1 tok/s | 106.7 / 125.8 / 147.1 tok/s | 1.83 [1.77-1.96] / 1.25 [1.05-1.28] / 1.08 [0.95-1.11] |
@@ -365,9 +370,10 @@ itself on every median:
 No preemption in any arm; needles at 50% and 90% depth of a 128k prompt retrieved and determinism at
 1k/8k/32k passing on all three. As on the mtp arm, the gain grows with context: at 8k the one-stream
 decode intervals include 1. Acceptance does not depend on the backend: per-position rates agree within
-0.01. **Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm. The
-measured image has the same vendored kernel, `pthfa/PIN` commit and build flags as this branch's; the
-files that differ are launchers, tests, docs and the header of `pthfa/PIN`.
+0.01. **Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm. These
+rows are from the earlier sitting above, on an image of the parent branch; this branch's own image has
+not been run yet. That image has the same vendored kernel, `pthfa/PIN` commit and build flags as this
+branch's; the files that differ are launchers, tests, docs and the header of `pthfa/PIN`.
 
 ## DFlash2 at 240k: `CTX=huge` (KVarN) also combines with `SPEC=dflash2`
 

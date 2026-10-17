@@ -1507,12 +1507,17 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     the drafter `TRITON_ATTN`: the DFlash2 drafter's five layers are sliding-window and non-causal,
     outside the list, so the knob leaves the speculative config as the arm writes it, with no
     `attention_backend`, and vLLM autoselects `TRITON_ATTN` for the drafter exactly as without the
-    knob. The other arms are not measured. Two settings are refused rather than combined, both
-    untested here: a KV offload tier (`KV_OFFLOAD_GB`), and `--attention-backend`, `--kv-cache-dtype`
-    or `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets; on
+    knob. The other arms are not measured. Refused rather than combined, all untested here: a KV
+    offload tier (`KV_OFFLOAD_GB`); `--attention-backend`, `--kv-cache-dtype` or
+    `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets (on
     mtp the speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and
     dropping it puts the MTP layer on another backend, while on dflash2 a `CUSTOM` there would stop
-    the boot at the drafter's layers. There are no tuning knobs: the library reads no
+    the boot at the drafter's layers); `FA2_FP8KV=1`, the other knob that picks the dflash2 backend;
+    and on dflash2 any drafting setup but the measured one: `DRAFT_METHOD` other than `dflash` (a
+    different drafter), `DFLASH_TOKENS` other than 7 (a different verify block on the target, adaptive
+    in length above 7) and `LOOKUP=0`. `VISION=1` on dflash2 is accepted but untested: it adds the
+    vision tower, which does not run on this backend, and leaves the target's attention as it is
+    (on mtp the measured shape has `VISION=1`). There are no tuning knobs: the library reads no
     environment variables, and its launch shape comes from a planner that is a pure function of the
     batch descriptor. The numbers so far are from one box, two RTX 3080 20 GB at TP=2, on vLLM 0.30.0
     and 0.31.0; on any other card they are still owed (`docs/long-context.md` says which).
