@@ -54,12 +54,16 @@
 namespace pth_attn {
 
 // Everything a launch needs: the frozen KernelParams plus the output dtype
-// (a runtime switch: it only touches the epilogue) and, for the whole-cell
-// loader, its cp.async width (loader.cuh cell_layout_width: 8 or 4).
+// (a runtime switch: it only touches the epilogue), for the whole-cell
+// loader its cp.async width (loader.cuh cell_layout_width: 8 or 4), and the
+// window of the windowed kernels (appended last, so every other
+// field keeps its parameter offset in the causal kernels).
 struct AttnParams {
   KernelParams k;
   int32_t out_dtype;   // PTH_ATTN_F32 / PTH_ATTN_F16 / PTH_ATTN_BF16
   int32_t cell_width;  // whole-cell instantiations only
+  int32_t window;      // windowed instantiations only: 0 = none
+  int32_t causal;      // windowed instantiations only: 1 causal, 0 not
 };
 
 // Shared memory of one instantiation: Q (T3's layout), two stages in the
@@ -322,23 +326,28 @@ __device__ __forceinline__ void produce_cells_regstaged(
 }
 
 // One loader warp's share of copying KV tile `tile` into `stage`
-// (loader.cuh; loader warp lw owns tokens 16 lw .. 16 lw + 15).
-template <int D, bool kCell, class Sm>
+// (loader.cuh; loader warp lw owns tokens 16 lw .. 16 lw + 15). kLower (the
+// windowed kernels) also zero-fills the tokens below kv_begin.
+template <int D, bool kCell, class Sm, bool kLower = false>
 __device__ __forceinline__ void issue_tile_to(const AttnParams& ap,
                                               const RowTile& rt, int32_t kvh,
                                               int32_t kv_end,
                                               uint32_t smem_base, int32_t tile,
-                                              int stage, int lw, int lane) {
+                                              int stage, int lw, int lane,
+                                              int32_t kv_begin = 0) {
+  static_assert(!(kCell && kLower), "the whole-cell loader has no lower bound");
   const KernelParams& p = ap.k;
-  const LaneRows mine = resolve_lane(p, rt.req, kvh, tile, kv_end, lw, lane);
+  const LaneRows mine =
+      resolve_lane<kLower>(p, rt.req, kvh, tile, kv_end, lw, lane, kv_begin);
   const DeviceCopy copy{smem_base +
                         static_cast<uint32_t>(Sm::stage_offset(stage))};
   if constexpr (kCell) {
     issue_tile_cell_lane<D>(p, mine, ap.cell_width, tile, kv_end, lw, lane,
                             DeviceBcast{}, copy);
   } else {
-    issue_tile_separate_lane<D>(p, mine, tile, kv_end, lw, lane, DeviceBcast{},
-                                DeviceBcast{}, copy);
+    issue_tile_separate_lane<D, kLower>(p, mine, tile, kv_end, lw, lane,
+                                        DeviceBcast{}, DeviceBcast{}, copy,
+                                        kv_begin);
   }
 }
 
@@ -389,8 +398,14 @@ __device__ __forceinline__ void run_producer_warp(
   }
 }
 
-template <int D, int WM, int SUB, typename QT, bool kCell>
+// kWindow: the sliding-window / non-causal variant. false
+// compiles to the causal kernel exactly (every window branch is
+// `if constexpr`); true exists only where it is instantiated
+// (attn_fwd_window_kernel: D = 128, separate streams).
+template <int D, int WM, int SUB, typename QT, bool kCell, bool kWindow = false>
 __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
+  static_assert(!kWindow || (!kCell && kAttnProducerWarps<D> == 0),
+                "windowed kernels: separate streams, no producer warps");
   using TT = AttnGeometry<D, WM, SUB>;
   using Sm = AttnSmem<D, WM, SUB, kCell>;
   using R = typename Sm::R;
@@ -408,17 +423,33 @@ __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
                 static_cast<int32_t>(blockIdx.x), rt)) {
     return;  // surplus q-tile of the padded grid
   }
-  const int32_t kv_end = kv_range_end(rt);
-  const int32_t min_limit = kv_min_limit(rt);
+  // The CTA's KV range [kv_begin, kv_end) and its split's tiles [tb, te):
+  // bottom-right causal, or the sliding / non-causal window, whose first
+  // tile may start below kv_begin (the loader zero-fills those tokens).
+  // min_limit is the smallest row limit (hi); max_lo the largest row lo.
+  int32_t kv_begin = 0, kv_end = 0, min_limit = 0;
+  [[maybe_unused]] int32_t max_lo = 0;
   int32_t tb = 0, te = 0;
-  split_tile_range(split, p.num_splits, num_kv_tiles(kv_end, kLoadTileTokens),
-                   tb, te);
+  if constexpr (kWindow) {
+    const bool causal = ap.causal != 0;
+    kv_begin = kv_window_range_begin(rt, ap.window);
+    kv_end = kv_window_range_end(rt, ap.window, causal);
+    min_limit = kv_window_min_hi(rt, ap.window, causal);
+    max_lo = kv_window_max_lo(rt, ap.window);
+    window_split_tile_range(split, p.num_splits, kv_begin, kv_end,
+                            kLoadTileTokens, tb, te);
+  } else {
+    kv_end = kv_range_end(rt);
+    min_limit = kv_min_limit(rt);
+    split_tile_range(split, p.num_splits, num_kv_tiles(kv_end, kLoadTileTokens),
+                     tb, te);
+  }
 
   const uint32_t smem_base = smem_u32(smem);
   constexpr int kProducers = kAttnProducerWarps<D>;
   auto issue_tile = [&](int32_t tile, int stage, int lw) {
-    issue_tile_to<D, kCell, Sm>(ap, rt, kvh, kv_end, smem_base, tile, stage, lw,
-                                lane);
+    issue_tile_to<D, kCell, Sm, kWindow>(ap, rt, kvh, kv_end, smem_base, tile,
+                                         stage, lw, lane, kv_begin);
   };
 
   if constexpr (kProducers > 0) {
@@ -440,16 +471,28 @@ __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
 
   const int g = frag_g(lane), q = frag_q(lane);
   float row_scale[2];
-  int32_t limit[2];
+  int32_t limit[2];                // the row's last visible position (its hi)
+  [[maybe_unused]] int32_t lo[2];  // the row's first visible position (kWindow)
   #pragma unroll
   for (int h = 0; h < 2; ++h) {
     const int r = warp_m * kMmaM + g + 8 * h;
     row_scale[h] = row_factor[r];
     int32_t tok = 0, hh = 0;
-    limit[h] = row_to_token_head(static_cast<uint32_t>(r), p.group, rt.num_tok,
-                                 tok, hh)
-                   ? kv_limit(rt.q_len, rt.seq_len, rt.tok_begin + tok)
-                   : -1;
+    if constexpr (kWindow) {
+      // Padding rows see nothing: [0, -1].
+      const bool real = row_to_token_head(static_cast<uint32_t>(r), p.group,
+                                          rt.num_tok, tok, hh);
+      const int32_t i = rt.tok_begin + tok;
+      lo[h] = real ? kv_window_lo(rt.q_len, rt.seq_len, i, ap.window) : 0;
+      limit[h] = real ? kv_window_hi(rt.q_len, rt.seq_len, i, ap.window,
+                                     ap.causal != 0)
+                      : -1;
+    } else {
+      limit[h] = row_to_token_head(static_cast<uint32_t>(r), p.group,
+                                   rt.num_tok, tok, hh)
+                     ? kv_limit(rt.q_len, rt.seq_len, rt.tok_begin + tok)
+                     : -1;
+    }
   }
 
   WarpSoftmax<D> st;
@@ -487,7 +530,11 @@ __device__ __forceinline__ void attn_fwd_body(const AttnParams& ap) {
           s[n][2 * h + 1] = (s[n][2 * h + 1] * k2.y) * row_scale[h];
         }
       }
-      if (subtile_needs_mask(abs0, SUB, min_limit)) {
+      if constexpr (kWindow) {
+        if (subtile_needs_window_mask(abs0, SUB, max_lo, min_limit)) {
+          apply_window_mask<SUB>(s, abs0, lo, limit, lane);
+        }
+      } else if (subtile_needs_mask(abs0, SUB, min_limit)) {
         apply_causal_mask<SUB>(s, abs0, limit, lane);
       }
       uint32_t pa[kNt][2];
@@ -631,6 +678,14 @@ __global__ void __launch_bounds__(kAttnThreads<D>, ctas_per_sm(D))
   attn_fwd_body<D, WM, SUB, QT, kCell>(ap);
 }
 
+// The windowed kernels: a separate name, so the causal kernels above keep
+// their symbols and their machine code is unchanged by this variant.
+template <int D, int WM, int SUB, typename QT>
+__global__ void __launch_bounds__(kAttnThreads<D>, ctas_per_sm(D))
+    attn_fwd_window_kernel(const __grid_constant__ AttnParams ap) {
+  attn_fwd_body<D, WM, SUB, QT, false, true>(ap);
+}
+
 // ---------------------------------------------------------------------------
 // Host side: one launch descriptor, and the per-D dispatchers defined in
 // instantiate_d{64,128,256}.cu (one translation unit per head size, so the
@@ -643,6 +698,7 @@ struct AttnLaunch {
   int32_t rows;     // bq * G: the decode kernel's n-tiles are ceil(rows / 8)
   int32_t q_dtype;  // PTH_ATTN_F16 or PTH_ATTN_BF16
   bool cell;        // whole-cell loader (ap.cell_width set) or separate streams
+  bool windowed;    // ap.window > 0 or !ap.causal: the windowed kernels
 };
 
 // The whole-cell loader exists where it fits next to the kernel's
@@ -651,6 +707,13 @@ struct AttnLaunch {
 // has 3 CTAs per SM to overlap copies already (ADR 0012 Amendment 1).
 template <int D>
 inline constexpr bool kAttnHasCell = D == 256;
+
+// The windowed kernels exist at D = 128 only, the head size of the DFlash2
+// drafter's sliding-window layers. A windowed D = 256 layer would need a
+// window variant of the decode kernel (attn_decode.cuh); the launcher
+// refuses window > 0 or non-causal at D = 64 and 256.
+template <int D>
+inline constexpr bool kAttnHasWindow = D == 128;
 
 // Launches `kKernel` with kSmemBytes of dynamic shared memory and
 // kBlockThreads threads per block. Above 48 KB the limit must be raised once
@@ -675,10 +738,27 @@ cudaError_t launch_attn_one(const AttnLaunch& L, cudaStream_t stream) {
                           kAttnThreads<D>>(L.grid, stream, L.ap);
 }
 
-// Picks the q dtype and the loader of one (D, WM) instantiation.
+template <int D, int WM, typename QT>
+cudaError_t launch_attn_window_one(const AttnLaunch& L, cudaStream_t stream) {
+  constexpr int kSub = default_sub<D, WM>();
+  return launch_with_smem<attn_fwd_window_kernel<D, WM, kSub, QT>,
+                          AttnSmem<D, WM, kSub, false>::kBytes,
+                          kAttnThreads<D>>(L.grid, stream, L.ap);
+}
+
+// Picks the q dtype and the loader (or the windowed kernel) of one (D, WM)
+// instantiation.
 template <int D, int WM>
 cudaError_t launch_attn_wm(const AttnLaunch& L, cudaStream_t stream) {
   const bool bf16 = L.q_dtype == PTH_ATTN_BF16;
+  if (L.windowed) {
+    if constexpr (kAttnHasWindow<D>) {
+      if (L.cell) return cudaErrorInvalidValue;
+      return bf16 ? launch_attn_window_one<D, WM, __nv_bfloat16>(L, stream)
+                  : launch_attn_window_one<D, WM, __half>(L, stream);
+    }
+    return cudaErrorInvalidValue;
+  }
   if constexpr (kAttnHasCell<D>) {
     if (L.cell) {
       return bf16 ? launch_attn_one<D, WM, __nv_bfloat16, true>(L, stream)

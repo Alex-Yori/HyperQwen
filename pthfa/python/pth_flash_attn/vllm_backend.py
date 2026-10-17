@@ -26,6 +26,15 @@ and the prefill slice. The batch is ordered decode first (Model Runner V2
 sorts it that way; a batch in another order is still correct, only slower, because
 the prefill launch handles any ``q_len``).
 
+Sliding window and non-causal attention are served at D = 128 only (the
+windowed kernel exists at that head size), the DFlash2 drafter's layers (window 2048,
+non-causal). The window is a layer constant: the Impl passes its own
+``sliding_window`` to the op, and the builder, which is per KV-cache group, takes
+it from the group's spec (vLLM groups layers by window) to cap the split count.
+``causal`` comes per group from ``CommonAttentionMetadata.causal``. A causal
+layer without a window calls the op with ``window=0, causal=True``: the causal
+kernel and the plan of before.
+
 Nothing here reads device data on the host, allocates in ``forward`` or calls
 ``torch.cuda`` (device questions go through ``current_platform``): the decode
 launch is capturable in a CUDA graph (``UNIFORM_BATCH``), and ``q_len`` of
@@ -35,8 +44,9 @@ adaptive verification (device ``q_len`` smaller than the host bound) works.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
@@ -70,6 +80,7 @@ from pth_flash_attn import ops
 from pth_flash_attn.planner import (
     MAX_ROWS_PER_CTA,
     SUPPORTED_HEAD_SIZES,
+    WINDOWED_HEAD_SIZES,
     LaunchPlan,
     max_tokens_per_tile,
     plan_launch,
@@ -195,6 +206,27 @@ def _group_size(num_heads_q: int, num_kv_heads: int) -> int:
     return group
 
 
+def _no_windowed_kernel(what: str, head_size: int) -> str:
+    """Reason text for a windowed/non-causal layer at a head size without kernel."""
+    return (
+        f"{what} at head size {head_size} (the windowed kernels exist for "
+        f"D = {', '.join(map(str, WINDOWED_HEAD_SIZES))} only)"
+    )
+
+
+def group_window(kv_cache_spec: AttentionSpec) -> int:
+    """Return the sliding window of a KV-cache group's layers, 0 for none.
+
+    vLLM puts only layers of one window into a group: a ``SlidingWindowSpec``
+    carries it, and so does a ``FullAttentionSpec`` when the hybrid allocator
+    is off and windowed layers are kept as full attention. Specs without the
+    field have no window. The builder uses it only to cap the split count;
+    the mask the kernel applies comes from each layer's Impl.
+    """
+    window = getattr(kv_cache_spec, "sliding_window", None)
+    return int(window) if window else 0
+
+
 class PthFlashAttnMetadataBuilder(AttentionMetadataBuilder[PthAttnMetadata]):
     """Builds the two launch slices of a step; allocates only a small buffer."""
 
@@ -233,6 +265,12 @@ class PthFlashAttnMetadataBuilder(AttentionMetadataBuilder[PthAttnMetadata]):
             raise NotImplementedError(
                 f"pth_flash_attn: head size {self.head_size} is not one of "
                 f"{SUPPORTED_HEAD_SIZES}"
+            )
+        self.window = group_window(kv_cache_spec)
+        if self.window and self.head_size not in WINDOWED_HEAD_SIZES:
+            raise NotImplementedError(
+                "pth_flash_attn: "
+                + _no_windowed_kernel("sliding window", self.head_size)
             )
         # The decode threshold is the most query tokens one row tile holds
         # (floor(64 / G)), raised to the verify length by spec-as-decode (a
@@ -291,6 +329,7 @@ class PthFlashAttnMetadataBuilder(AttentionMetadataBuilder[PthAttnMetadata]):
             num_sms=self.num_sms,
             is_prefill=is_prefill,
             ws_token_splits=self.ws_token_splits,
+            window=self.window,
         )
         n = req_end - req_start
         qsl = cam.query_start_loc
@@ -333,10 +372,17 @@ class PthFlashAttnMetadataBuilder(AttentionMetadataBuilder[PthAttnMetadata]):
         cam = common_attn_metadata
         if common_prefix_len > 0:
             raise NotImplementedError("pth_flash_attn: cascade attention")
-        if cam.causal is not True:
+        causal = cam.causal
+        if not isinstance(causal, bool):
+            # vLLM types it bool | Tensor; a tensor is a per-request mask.
             raise NotImplementedError(
-                "pth_flash_attn: only causal attention is served (got "
-                f"{type(cam.causal).__name__})"
+                "pth_flash_attn: per-request causal masks are not supported (got "
+                f"{type(causal).__name__}); causal must be one bool per group"
+            )
+        if not causal and self.head_size not in WINDOWED_HEAD_SIZES:
+            raise NotImplementedError(
+                "pth_flash_attn: "
+                + _no_windowed_kernel("non-causal attention", self.head_size)
             )
         if cam.rswa_prefix_lens is not None:
             raise NotImplementedError("pth_flash_attn: R-SWA is not supported")
@@ -392,7 +438,7 @@ class PthFlashAttnMetadataBuilder(AttentionMetadataBuilder[PthAttnMetadata]):
             seq_lens=cam.seq_lens,
             block_table=cam.block_table_tensor,
             slot_mapping=cam.slot_mapping,
-            causal=True,
+            causal=causal,
             decode=decode,
             prefill=prefill,
         )
@@ -456,18 +502,41 @@ class PthFlashAttnBackend(TritonAttentionBackend):
 
     @classmethod
     def supports_non_causal(cls) -> bool:
-        """No: the kernel masks causally."""
-        return False
+        """Yes, at D = 128 (``validate_configuration`` refuses other sizes)."""
+        return True
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
-        """No sliding window."""
-        return False
+        """Yes, at D = 128 (``validate_configuration`` refuses other sizes)."""
+        return True
 
     @classmethod
     def supports_rswa(cls) -> bool:
-        """No R-SWA."""
+        """No R-SWA: prefix tokens that stay globally visible are not modelled."""
         return False
+
+    @classmethod
+    def validate_configuration(cls, *args: Any, **kwargs: Any) -> list[str]:
+        """Return vLLM's reasons, plus: windowed or non-causal needs D = 128.
+
+        ``supports_sliding_window``/``supports_non_causal`` take no head size,
+        so the refusal at D = 64 and 256 (no windowed kernel there) is added
+        here, where an explicit selection gets it as a reason instead of a
+        load-time error.
+        The arguments are bound to the base signature (it differs across vLLM
+        versions), so its defaults apply and keyword or positional calls agree.
+        """
+        reasons = super().validate_configuration(*args, **kwargs)
+        bound = inspect.signature(super().validate_configuration).bind(*args, **kwargs)
+        bound.apply_defaults()
+        arg = bound.arguments
+        head_size = arg["head_size"]
+        if head_size in SUPPORTED_HEAD_SIZES and head_size not in WINDOWED_HEAD_SIZES:
+            if arg["has_sliding_window"]:
+                reasons.append(_no_windowed_kernel("sliding window", head_size))
+            if arg["use_non_causal"]:
+                reasons.append(_no_windowed_kernel("non-causal attention", head_size))
+        return reasons
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -521,7 +590,10 @@ class PthFlashAttnImpl(TritonAttentionImpl):
         if alibi_slopes is not None or use_alibi_sqrt:
             unsupported.append("ALiBi")
         if sliding_window is not None:
-            unsupported.append("sliding window")
+            if sliding_window < 1:
+                unsupported.append(f"sliding window {sliding_window}")
+            elif head_size not in WINDOWED_HEAD_SIZES:
+                unsupported.append(_no_windowed_kernel("sliding window", head_size))
         if logits_soft_cap:
             unsupported.append("logits soft cap")
         if sinks is not None:
@@ -560,6 +632,9 @@ class PthFlashAttnImpl(TritonAttentionImpl):
             raise NotImplementedError("pth_flash_attn: int8_per_token_head only")
         # The query stays 16-bit: there is no quantised-query input.
         self.supports_quant_query_input = False
+        # The op's window: Triton's ``self.sliding_window`` is a (left, right)
+        # tuple that vLLM's helpers read, so the int is kept separately.
+        self.window = 0 if sliding_window is None else int(sliding_window)
         self._cache_views: tuple[int, tuple[torch.Tensor, ...]] | None = None
         self._ws_token_splits = 0
         self._no_workspace: torch.Tensor | None = None
@@ -630,6 +705,7 @@ class PthFlashAttnImpl(TritonAttentionImpl):
         query: torch.Tensor,
         output: torch.Tensor,
         caches: tuple[torch.Tensor, ...],
+        causal: bool,
     ) -> None:
         """One op call for one slice; workspace views of this launch's size."""
         plan = part.plan
@@ -666,6 +742,8 @@ class PthFlashAttnImpl(TritonAttentionImpl):
             self.scale,
             ws_o,
             ws_lse,
+            self.window,
+            causal,
         )
 
     def forward(
@@ -706,7 +784,11 @@ class PthFlashAttnImpl(TritonAttentionImpl):
             return output.fill_(0)
         caches = self._caches(kv_cache)
         if attn_metadata.decode is not None:
-            self._run_slice(attn_metadata.decode, query, output, caches)
+            self._run_slice(
+                attn_metadata.decode, query, output, caches, attn_metadata.causal
+            )
         if attn_metadata.prefill is not None:
-            self._run_slice(attn_metadata.prefill, query, output, caches)
+            self._run_slice(
+                attn_metadata.prefill, query, output, caches, attn_metadata.causal
+            )
         return output

@@ -21,8 +21,8 @@ STABLE_TORCH_LIBRARY(pth_flash_attn, m) {
       "pth_flash_attn_fwd(Tensor! out, Tensor q, Tensor k_cache, "
       "Tensor v_cache, Tensor k_scale, Tensor v_scale, Tensor block_table, "
       "Tensor seq_lens, Tensor query_start_loc, int max_query_len, int wm, "
-      "int num_splits, float softmax_scale, Tensor! ws_o, Tensor! ws_lse) "
-      "-> ()");
+      "int num_splits, float softmax_scale, Tensor! ws_o, Tensor! ws_lse, "
+      "int window=0, bool causal=True) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(pth_flash_attn, CUDA, m) {
