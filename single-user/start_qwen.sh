@@ -514,6 +514,23 @@ fi
 # pool"). It used to be passed inside the dflash2 branch alone, so SPEC=mtp and SPEC=off
 # ignored an exported KV_MEM without a word (#68, #210).
 [ -n "${KV_MEM:-}" ] && EXTRA_ARGS="--kv-cache-memory=$KV_MEM ${EXTRA_ARGS}"
+# DYNAMIC_K: on the reference 3090 at SPEC=dflash2 DFLASH_TOKENS=7, [[1,3,7],[4,512,3]] lifted decode at 4
+# streams +7.7%, +8.0% and +9.2% in three A/Bs, single-stream within 1%. It buys step time, not seats: the recurrent-state
+# pages are reserved for num_speculative_tokens, not the k a step runs at, so only a lower DFLASH_TOKENS buys
+# residents. Refused at CTX=huge + PREFIX_CACHE=1: a k that moves with the batch size is a verify length that
+# changes step to step, which the VLLM_DFLASH2_LOOKUP_ADAPTIVE comment above shows corrupts a prefix-cache hit.
+if [ -n "${DYNAMIC_K:-}" ]; then
+  if [ -z "$SPEC_CFG" ]; then
+    echo "[start_qwen] DYNAMIC_K ignored: SPEC=$SPEC has no speculative decoding to schedule." >&2
+  elif [ "$CTX" = "huge" ] && [ "${PREFIX_CACHE:-0}" = "1" ]; then
+    echo "DYNAMIC_K refused at CTX=huge + PREFIX_CACHE=1: a per-batch-size k changes the verify length when the" >&2
+    echo "  batch crosses a range, which corrupts a prefix-cache hit on the KVarN cache (see the" >&2
+    echo "  VLLM_DFLASH2_LOOKUP_ADAPTIVE comment in single-user/start_qwen.sh). Unset DYNAMIC_K or PREFIX_CACHE." >&2
+    exit 1
+  else
+    SPEC_CFG="${SPEC_CFG%\}},\"num_speculative_tokens_per_batch_size\":$DYNAMIC_K}"
+  fi
+fi
 SPEC_ARGS=()
 [ -n "$SPEC_CFG" ] && SPEC_ARGS=(--speculative-config "$SPEC_CFG")
 

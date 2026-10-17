@@ -428,6 +428,7 @@ included (`tools` + `tool_choice: "auto"` come back as `tool_calls`).
 | `DRAFT_TOKENS` | 4 (3 for `CTX=long`/`huge`) | speculative depth; 5 and 6 are slower |
 | `SPEC_ATTN` | 1 (`CTX=fast` only) | split-KV Triton attention for the verify step (`patches/spec-decode-attn.patch`); 0 = FlashAttention-2 |
 | `DRAFT_SAMPLE` | `probabilistic` | `greedy` drafts: same speed at T=0, ~15% slower at T>0 |
+| `DYNAMIC_K` | unset | per-batch-size draft count (vLLM's `num_speculative_tokens_per_batch_size`): inclusive `[first_batch, last_batch, k]` ranges as JSON, e.g. `[[1,3,7],[4,512,3]]`. At `DFLASH_TOKENS=7` that measured +7.7% to +9.2% decode at 4 streams in three A/Bs, single-stream unchanged. Buys step time, not seats (state pages stay sized for the configured k). Ignored with `SPEC=off`, refused with `CTX=huge` + `PREFIX_CACHE=1` |
 | `MAX_SEQS` | 8 | how many requests are *admitted*, not how many the pool can hold: each resident request needs k+1 recurrent-state slots (0.88 GiB at DFlash2 k=7 — seven residents with short prompts, five at 4k, two at 16k), and the launcher prints the number at boot |
 | `MAX_LEN` | 65536 (`fast`) / 150000 (`long`) | 150k needs `GPU_UTIL` 0.93 |
 | `GPU_UTIL` | 0.93 | soak-tested with a 100k prompt and 4×6k-token generations; batch mode's 0.972 OOMs in the MTP path (docs/gotchas.md, gotcha 4) |
