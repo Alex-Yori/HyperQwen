@@ -344,36 +344,49 @@ is accepted and untested on this arm (gotcha 63).
 
 **Measured on two RTX 3080 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090:** the
 same box as above (Linux in a Proxmox LXC container, driver 615.71.09, PCIe without P2P). Capped
-state (220 W, 1905 MHz lock), vLLM 0.31.0, the default DFlash2 target (`Qwen3.8-27B-W4A16-AutoRound-fast`)
-and drafter (`Qwen3.8-27B-DFlash2-W4A16`), text-only, k=7 with lookup drafting on, `PREFIX_CACHE=1
+state (220 W, 1905 MHz lock), vLLM 0.31.0, text-only, k=7 with lookup drafting on, `PREFIX_CACHE=1
 MAX_SEQS=2 MAX_LEN=262144 GPU_UTIL=0.94 NCCL_P2P_DISABLE=1` and
 `EXTRA_ARGS="--tensor-parallel-size 2 --disable-custom-all-reduce --max-num-batched-tokens 8192 --long-prefill-token-threshold 1024"`.
-Three arms back to back in one sitting on 2026-10-14: `TRITON_ATTN` on `main`'s image (the arm without
-the knob), `FLASH_ATTN` fp8 with the FA2 port of #315-#317 (`FA2_FP8KV=1` on that stack's own image, not
-part of this tree), and `CUSTOM` on the target on an image of the branch this one is cut from (d77c45a)
-whose launcher was edited to give this knob's argv, byte for byte (checked against a stub `vllm`).
-Distinct 8k / 32k / 128k prompts, 256 tokens out, greedy; medians of 3 reps (8k: 5) unless
-the row says n, 95% CI of the ratio in brackets. `main`'s arm, repeated last, read within about 1.5% of
-itself on every median:
+Checkpoints are the launcher's defaults: the target `models/Qwen3.8-27B-W4A16-AutoRound-fast`, which
+`prepare/fetch_fast_variant.py` assembles from `dbirks/Qwen3.8-27B-W4A16-AutoRound` (its shards, hardlinked)
+and `syvai/qwen3.8-27b-3090-fast-variant` (int4-GPTQ lm_head and MTP module, draft vocabulary), and the
+drafter `models/Qwen3.8-27B-DFlash2-W4A16`, fetched by `prepare/fetch_dflash2.py` from
+`syvai/Qwen3.8-27B-DFlash2-W4A16`.
 
-| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | `TRITON_ATTN` (int8) | `FLASH_ATTN` fp8 (FA2 port) | `CUSTOM` target (int8, `PTH_FA=1` argv; earlier image, 2026-10-14) | `CUSTOM` / `TRITON_ATTN` |
-|---|---|---|---|---|
-| TTFT 128k cold (n=1) / 32k warm (n=5) / 8k warm (n=7) | 251.7 / 31.30 / 6.01 s | 114.8 / 22.96 / 5.48 s | 123.7 / 23.46 / 5.51 s | 0.491 / 0.750 [0.60-0.89] / 0.916 [0.913-0.918] |
-| 1 stream decode at 128k / 32k / 8k | 58.3 / 101.0 / 136.1 tok/s | 81.4 / 111.5 / 134.1 tok/s | 106.7 / 125.8 / 147.1 tok/s | 1.83 [1.77-1.96] / 1.25 [1.05-1.28] / 1.08 [0.95-1.11] |
-| ms per forward pass, same | 54.8 / 31.1 / 25.3 | 36.9 / 28.7 / 24.8 | 29.4 / 24.8 / 23.9 | 0.537 [0.529-0.541] / 0.798 [0.793-0.801] / 0.942 [0.925-0.950] |
-| 2 streams, per stream, same | 32.4 / 53.4 / 78.6 tok/s | 38.9 / 54.0 / 74.0 tok/s | 54.1 / 68.7 / 80.8 tok/s | 1.67 [1.59-1.74] / 1.29 [1.13-1.41] / 1.03 [1.00-1.11] |
-| 2-stream pair TTFT at 128k | 485.7 s | 285.8 s | 241.4 s | 0.497 |
-| accepted length per draft (of 7), GSM8K window | 4.807 | 4.838 | 4.810 | 1.001 |
-| GSM8K n=200, greedy | 0.955 | 0.955 | 0.965 | +1.0 pt |
-| KV pool at `MAX_LEN=262144` | 477,216 tokens | 517,656 tokens | 504,770 tokens | 1.058 |
+Two sittings on 2026-10-17, each with `main`'s image on `TRITON_ATTN` (the arm without the knob, built
+from 95ee3b6) as the same-sitting control, run first and repeated last for drift. First sitting: this
+branch's image built at 8b55d4a with `PTH_FA=1`. 8b55d4a is this branch before its last commit
+(a61f0a6), which adds refusals, tests and docs only: the argv of this arm and the `pthfa/` files are the
+same. Second sitting: the image built at a61f0a6, the same launch, to confirm the final commit. Distinct
+8k / 32k / 128k prompts (the same prompts in both sittings), 256 tokens out, greedy; medians of 3 reps
+(8k: 5) unless the row says n; ratio `CUSTOM` / `TRITON_ATTN` of the same sitting, 95% CI in brackets:
+
+| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | 1st sitting: `TRITON_ATTN` (int8) | 1st: `CUSTOM` target (`PTH_FA=1`, image at 8b55d4a) | 1st: ratio | 2nd sitting: `TRITON_ATTN` (int8) | 2nd: `CUSTOM` target (`PTH_FA=1`, image at a61f0a6) | 2nd: ratio |
+|---|---|---|---|---|---|---|
+| TTFT 128k cold (n=1) / 32k warm (n=5) / 8k warm (n=7) | 249.3 / 30.99 / 5.93 s | 122.5 / 23.24 / 5.44 s | 0.491 / 0.750 [0.60-0.89] / 0.918 [0.913-0.921] | 249.6 / 31.01 / 5.93 s | 122.4 / 23.21 / 5.47 s | 0.491 / 0.748 [0.60-0.89] / 0.922 [0.920-0.925] |
+| 1 stream decode at 128k / 32k / 8k | 58.9 / 101.9 / 138.5 tok/s | 108.1 / 126.3 / 148.1 tok/s | 1.84 [1.77-1.96] / 1.24 [1.05-1.28] / 1.07 [0.95-1.10] | 59.1 / 102.2 / 138.1 tok/s | 107.3 / 127.2 / 147.3 tok/s | 1.81 [1.76-1.95] / 1.24 [1.05-1.28] / 1.07 [0.95-1.11] |
+| ms per forward pass, same | 55.0 / 31.0 / 25.2 | 29.2 / 24.6 / 23.6 | 0.531 [0.528-0.536] / 0.794 [0.793-0.801] / 0.939 [0.933-0.957] | 54.9 / 30.9 / 25.1 | 29.1 / 24.5 / 23.7 | 0.531 [0.527-0.537] / 0.793 [0.786-0.801] / 0.944 [0.935-0.952] |
+| 2 streams, per stream, same | 32.8 / 54.1 / 79.7 tok/s | 54.8 / 69.6 / 81.4 tok/s | 1.67 [1.58-1.75] / 1.29 [1.13-1.41] / 1.02 [1.00-1.11] | 32.8 / 54.0 / 78.9 tok/s | 54.8 / 70.1 / 81.3 tok/s | 1.67 [1.59-1.73] / 1.30 [1.14-1.42] / 1.03 [1.00-1.09] |
+| 2-stream pair TTFT at 128k | 480.0 s | 239.4 s | 0.499 [0.497-0.499] | 482.1 s | 239.3 s | 0.496 [0.490-0.499] |
+| accepted length per draft (of 7), GSM8K window | 4.789 | 4.811 | 1.005 | 4.796 | 4.812 | 1.003 |
+| GSM8K n=200, greedy | 0.955 | 0.960 | +0.5 pt | 0.955 | 0.960 | +0.5 pt |
+| KV pool at `MAX_LEN=262144` | 477,599 tokens | 504,770 tokens | 1.057 | 477,599 tokens | 504,770 tokens | 1.057 |
 
 No preemption in any arm; needles at 50% and 90% depth of a 128k prompt retrieved and determinism at
-1k/8k/32k passing on all three. As on the mtp arm, the gain grows with context: at 8k the one-stream
-decode intervals include 1. Acceptance does not depend on the backend: per-position rates agree within
-0.01. **Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm. These
-rows are from the earlier sitting above, on an image of the parent branch; this branch's own image has
-not been run yet. That image has the same vendored kernel, `pthfa/PIN` commit and build flags as this
-branch's; the files that differ are launchers, tests, docs and the header of `pthfa/PIN`.
+1k/8k/32k passing in every arm with the full gate set. The control repeated last moved by at most 1.4%
+on any median in the first sitting (decode and TTFT 0.992-1.003, ms per pass 1.001-1.014) and by about
+1% in the second (ms per pass 0.988-1.002, decode 0.990-1.006, all CIs including 1). The two `CUSTOM`
+images agree within that drift (ms per pass 29.2 / 24.6 / 23.6 against 29.1 / 24.5 / 23.7). As on the
+mtp arm, the gain grows with context: at 8k the one-stream decode intervals include 1. Acceptance does
+not depend on the backend: per-position rates agree within 0.01. Prefix caching with the arm's FULL
+graphs: every one of the 128 prompt-length residues, sent twice so the second is a full prefix-cache
+hit, comes back verbatim with `PTH_FA=1` on both images, 0 broken of 128 (`bench/residue_sweep.py`; the
+corpus was a stand-in, this repo's `README.md` and `docs/*.md`, because the sweep's usual corpus file was
+not on this box; the test depends on the prompt length mod 128, not on the text). For reference, the
+FA2 fp8 port of #315-#317 (`FA2_FP8KV=1` on that stack's own image, not part of this tree) was measured
+on the same box and state in an earlier sitting (2026-10-14), not repeated here: 81.4 tok/s one-stream
+decode at 128k, against 58.3 on `TRITON_ATTN` and 106.7 with this arm's argv in that sitting.
+**Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm.
 
 ## DFlash2 at 240k: `CTX=huge` (KVarN) also combines with `SPEC=dflash2`
 

@@ -282,10 +282,9 @@ fi
 # skips the drafter's windowed layers (patches/spec-decode-int8-kv.patch). Only the measured drafting
 # setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or dflash), DFLASH_TOKENS unset or 7, and
 # LOOKUP unset or 1; anything else on this arm is refused. Capped 2x RTX 3080 20 GB at TP=2, vLLM
-# 0.31.0, against TRITON_ATTN on the same cache: 128k TTFT 123.7 s against 251.7 s, N=1 decode at 128k
-# 106.7 against 58.3 tok/s, accepted length 4.81 of 7 drafts on both, GSM8K 0.965 against 0.955.
-# Provisional: those rows are from an earlier sitting (2026-10-14) on the image of the branch this one
-# is cut from, with a launcher giving this argv; they are to be replaced by this branch's own image.
+# 0.31.0, this branch's image against main's image on TRITON_ATTN with the same cache, same sitting
+# (2026-10-17): 128k cold TTFT 122.5 s against 249.3 s, N=1 decode at 128k 108.1 against 58.9 tok/s,
+# accepted length 4.81 against 4.79 of 7 drafts, GSM8K 0.960 against 0.955 (docs/long-context.md).
 PTH_FA=${PTH_FA:-0}
 PTH_SPEC_BACKEND=
 if [ "$PTH_FA" = 1 ]; then
