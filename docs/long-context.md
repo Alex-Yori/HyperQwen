@@ -361,8 +361,17 @@ the ones above on every card the kernel serves, and the effective-config line re
 `FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6 default)`. An explicit `FA2_FP8KV=1` with `PTH_FA=1` is refused
 before either plugin is probed (`resolve_config.sh`); `FA2_FP8KV=0` is accepted.
 
-**Boot log, this branch's image:** <pending> (expected: `Using AttentionBackendEnum.CUSTOM backend` for
-the target and for the drafter on each rank, FULL graphs for the target and the `dflash2` head).
+**Boot log, this branch's image (`PTH_FA=1`, the sitting below):** `Using AttentionBackendEnum.CUSTOM
+backend.` four times, for the target and for the drafter on each of the two ranks, and no
+`Using TRITON_ATTN attention backend` line (the target-only arm has one, the drafter's autoselect); the
+engine's speculative config carries `'attention_backend': 'CUSTOM'` and the cache is
+`int8_per_token_head`; the backend reserves its workspace for 16 target layers (`Hq=12, D=256`) and 5
+drafter layers (`Hq=16, D=128`) per rank; FULL CUDA graphs are captured for the target and for the
+`dflash2` head; the KV pool is 504,770 tokens, as with the target only; no `NotImplementedError` or
+`does not support`. On one of the GPUs, before the sitting, `bench/test_pthfa_attn.py` passes 51 of 51
+cases on this image, including the 14 of part 4 (the drafter's shapes, windowed and non-causal, against
+an fp64 reference, with blocks below the window on vLLM's null block; max error 0.52 of the tolerance),
+and `pthfa/tests/gate_test.py` passes all 34 checks with the GPU visible.
 
 **Target on the kernel, drafter on `TRITON_ATTN` (the parent branch's setting), measured on two RTX 3080
 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090:** the same box as above (Linux in a
@@ -460,26 +469,63 @@ kernel). One run per arm, no CIs. The corpus was a stand-in, this repo's markdow
 usual corpus was not on this box; the arms share it, absolute numbers are not comparable with other
 machines'.
 
-**Target and drafter on the kernel (`PTH_FA=1` on this branch's image):** <pending>. Same box, state and
-launch shape as above, three arms back to back in one sitting: this branch's image with `PTH_FA=1`, the
-parent branch's image with `PTH_FA=1` (target only), and this branch's image with `PTH_FA` unset
-(`TRITON_ATTN`, the control).
+**Target and drafter on the kernel (`PTH_FA=1` on this branch's image), measured in the second sitting
+above** (2026-10-17, same box, capped state, launch shape and prompts): `main`'s image on `TRITON_ATTN`
+(built from 95ee3b6, the control), this branch's image with `PTH_FA=1`, the parent branch's image at
+a61f0a6 with `PTH_FA=1` (target only), each with the full gate set; then a second boot of each of the two
+`CUSTOM` images (ladders and TTFT only, 5 reps), and the control's ladders again last. The measured image
+vendors pth-flash-attn 07e5063; this branch pins a31d8ab, which differs from it in comments and
+docstrings only (the Python modules have equal syntax trees without docstrings, the C++/CUDA files are
+token for token the same without comments, and the exported sources compile to the same SASS), and its
+launcher gives the measured launch the same argv as this branch's (which adds the `DYNAMIC_K` refusal
+only; `DYNAMIC_K` was unset). Medians of the first boot of each arm (3 reps, 8k: 5); the "both / target
+only" column pools
+the two boots of each `CUSTOM` arm (8 reps, 8k: 10), the "both / `TRITON_ATTN`" column is the first boots;
+95% CI in brackets:
 
-| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | `TRITON_ATTN` (int8, knob unset) | `CUSTOM` target only (parent branch) | `CUSTOM` target and drafter (`PTH_FA=1`) | both / target only | both / `TRITON_ATTN` |
+| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | `TRITON_ATTN` (int8, `main`'s image) | `CUSTOM` target only (parent branch at a61f0a6) | `CUSTOM` target and drafter (`PTH_FA=1`) | both / target only | both / `TRITON_ATTN` |
 |---|---|---|---|---|---|
-| TTFT 128k cold / 32k warm / 8k warm | <pending> | <pending> | <pending> | <pending> | <pending> |
-| 1 stream decode at 128k / 32k / 8k | <pending> | <pending> | <pending> | <pending> | <pending> |
-| ms per forward pass, same | <pending> | <pending> | <pending> | <pending> | <pending> |
-| 2 streams, per stream, same | <pending> | <pending> | <pending> | <pending> | <pending> |
-| 2-stream pair TTFT at 128k | <pending> | <pending> | <pending> | <pending> | <pending> |
-| accepted length per draft (of 7), GSM8K window | <pending> | <pending> | <pending> | <pending> | <pending> |
-| GSM8K n=200, greedy | <pending> | <pending> | <pending> | <pending> | <pending> |
-| KV pool at `MAX_LEN=262144` | <pending> | <pending> | <pending> | <pending> | <pending> |
+| TTFT 128k cold (n=1) / 32k warm (n=5) / 8k warm (n=7) | 249.6 / 31.01 / 5.93 s | 122.4 / 23.21 / 5.47 s | 122.2 / 23.10 / 5.43 s | 0.998 / 0.996 [0.80-1.24] / 0.992 [0.989-0.996] (first boots) | 0.490 / 0.745 [0.60-0.89] / 0.915 [0.913-0.919] |
+| 1 stream decode at 128k / 32k / 8k | 59.1 / 102.2 / 138.1 tok/s | 107.3 / 127.2 / 147.3 tok/s | 115.8 / 129.4 / 151.3 tok/s | 1.054 [1.002-1.087] / 1.033 [0.992-1.081] / 1.025 [0.945-1.115] | 1.96 [1.86-2.05] / 1.27 [1.09-1.32] / 1.10 [0.97-1.16] |
+| ms per forward pass, same | 54.9 / 30.9 / 25.1 | 29.1 / 24.5 / 23.7 | 28.2 / 24.1 / 22.6 | **0.975 [0.964-0.986] / 0.974 [0.932-0.984] / 0.967 [0.955-0.978]** | 0.514 [0.511-0.517] / 0.780 [0.769-0.786] / 0.900 [0.891-0.912] |
+| 2 streams, per stream, same | 32.8 / 54.0 / 78.9 tok/s | 54.8 / 70.1 / 81.3 tok/s | 55.3 / 71.0 / 83.7 tok/s | 1.013 [0.976-1.064] / 1.014 [0.974-1.088] / 1.031 [0.971-1.064] | 1.69 [1.63-1.80] / 1.32 [1.17-1.45] / 1.06 [1.03-1.11] |
+| ms per forward pass, 2 streams | 63.9 / 36.2 / 29.5 | 39.0 / 30.2 / 28.2 | 38.4 / 29.6 / 27.3 | 0.986 [0.979-0.994] / 0.979 [0.966-0.983] / 0.971 [0.967-0.984] | 0.601 [0.596-0.609] / 0.816 [0.804-0.827] / 0.924 [0.913-0.939] |
+| 2-stream pair TTFT at 128k | 482.1 s | 239.3 s | 237.8 s | 0.994 [0.993-0.996] (first boots) | 0.493 [0.487-0.497] |
+| accepted length per draft (of 7), GSM8K window | 4.796 | 4.812 | 4.827 | 1.003 | 1.006 |
+| GSM8K n=200, greedy | 0.955 | 0.960 | 0.960 | 0 pt | +0.5 pt |
+| KV pool at `MAX_LEN=262144` | 477,599 tokens | 504,770 tokens | 504,770 tokens | 1.000 | 1.057 |
 
-**Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm. The
-drafter-side kernel check is part 4 of `bench/test_pthfa_attn.py` (the drafter's shapes, windowed and
-non-causal, against an fp64 reference, including blocks below the window on vLLM's null block):
-<pending> on this branch's image.
+**What it buys over the target-only arm: 2.5-3.3% less time per decode pass at one stream (1.4-2.9% at
+two), and no established tok/s gain.** Every ms-per-pass interval of "both / target only" excludes 1,
+and the profile below shows where the time goes. The per-stream tok/s ratios are all above 1 as point
+estimates, but their intervals include 1 in five of six cells; the one that excludes 1 (one stream at
+128k) is inflated by about 3% by acceptance on that particular prompt: the ladder's 128k prompt gets
+3.200 tokens per step with both models on the kernel and 3.108 with the target only, the same in both
+boots, so per prompt the acceptance differs while on GSM8K it differs by 0.3% (per position within
+0.0025). Per boot, the two boots of each `CUSTOM` image agree within about 1% in ms per pass, and all
+12 per-boot ratios (6 rows, 2 boot pairs) are below 1 (0.952-0.991); the pooled intervals treat reps
+as independent and are narrower than that boot-to-boot spread. SM clock and power were the same in both
+arms. Prefill does not change (TTFT ratios 0.99-1.01: the drafter's attention is not on the prefill
+path). The control's ladders, repeated last, moved by about 1% (ms per pass 0.988-1.002). No preemption
+in any arm; needles at 50% and 90% depth of a 128k prompt retrieved, determinism at 1k/8k/32k passing,
+and the residue sweep 0 broken of 128 with both models on the kernel (same stand-in corpus as above).
+
+Per engine step, from a torch profile of one rank (4 windows of 40 decode steps per depth, one stream,
+the same images and launch; median over windows, ms per step; the other rank within 2%):
+
+| rank 0, ms per step | target only, 8k | both, 8k | target only, 128k | both, 128k |
+|---|---|---|---|---|
+| drafter attention, 5 layers (`TRITON_ATTN` unified kernel, or this kernel's windowed kernel + combine) | 0.878 | 0.098 | 0.918 | 0.102 |
+| target attention + combine, 16 layers | 0.746 | 0.755 | 5.631 | 5.664 |
+| everything else | 21.47 | 21.57 | 22.09 | 22.22 |
+| step wall (median spacing of consecutive steps) | 23.49 | 22.73 | 29.03 | 28.40 |
+
+The drafter's attention falls from 175 / 183 us per layer call on `TRITON_ATTN` to 13 + 7 us (window
+kernel + combine) at 8k / 128k, saving 0.78 ms per step at 8k (3.3% of the target-only step) and 0.82 ms
+at 128k (2.8%); the step wall shortens by 0.75 / 0.62 ms, which matches the ladders' ms-per-pass ratios.
+The traces with both models on the kernel contain no `TRITON_ATTN` attention kernel.
+
+**Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm.
 
 ## DFlash2 at 240k: `CTX=huge` (KVarN) also combines with `SPEC=dflash2`
 
