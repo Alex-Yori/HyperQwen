@@ -5,8 +5,8 @@
 # only, with the arm's speculative config byte for byte (the DFlash2 drafter autoselects TRITON_ATTN); neither
 # changes anything else in the argv or the VLLM_* environment; every other arm, a conflicting EXTRA_ARGS, a KV
 # connector, a missing install, a value other than 0/1, FA2_FP8KV=1 alongside it and, on dflash2, a drafting setup
-# other than the measured one (DRAFT_METHOD, DFLASH_TOKENS, LOOKUP) are refused, each with its own message; batch
-# mode warns and ignores it. Copies
+# other than the measured one (DRAFT_METHOD, DFLASH_TOKENS, LOOKUP, DYNAMIC_K) are refused, each with its own
+# message; batch mode warns and ignores it. Copies
 # the checkout, without its own venv, to a temp dir and runs the launchers against a stub vllm (prints its argv,
 # then "@@ENV" and its VLLM_* environment) and a stub venv python (answers the install probe from
 # PTHFA_STUB_INSTALLED, accepts the FA2 fp8 plugin's probe, and passes anything else to python3). No GPU, no model,
@@ -42,7 +42,7 @@ stage "$REPO" "$T/new"
 # the stub venv has no fa2 plugin, so that arm would refuse for a reason that has nothing to do with PTH_FA.
 run() { local tree=$1 sc=$2; shift 2
   (cd "$tree" && env -u PRINT_ARGV -u PTH_FA -u KV_OFFLOAD_GB -u EXTRA_ARGS -u SPEC -u CTX -u PYTORCH_CUDA_ALLOC_CONF \
-     -u WSL_DISTRO_NAME -u CUDA_HOME -u FA2_FP8KV -u DRAFT_METHOD -u DFLASH_TOKENS -u LOOKUP -u VISION \
+     -u WSL_DISTRO_NAME -u CUDA_HOME -u FA2_FP8KV -u DRAFT_METHOD -u DFLASH_TOKENS -u LOOKUP -u VISION -u DYNAMIC_K \
      VLLM_API_KEY=k FA2_FP8KV=0 "$@" bash "$sc" 2>"$T/err" </dev/null); echo $? > "$T/rc"; }
 rc() { cat "$T/rc"; }
 # after <flag>: the argument that follows <flag> in the argv on stdin ("none" if absent; every value if repeated).
@@ -104,9 +104,9 @@ grep -q '^\[start_qwen\] PTH_FA=1: .*target only; the DFlash2' "$T/don.err" \
   && check 1 1 "the launcher says the drafter is left to autoselect" || check 1 0 "the launcher says the drafter is left to autoselect"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--tensor-parallel-size 2 --disable-custom-all-reduce" > "$T/tp"
 check "0 2" "$(rc) $(after --tensor-parallel-size < "$T/tp")" "TP=2 through EXTRA_ARGS boots"
-run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 DRAFT_METHOD=dflash DFLASH_TOKENS=7 LOOKUP=1 FA2_FP8KV=0 > "$T/dexp"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 DRAFT_METHOD=dflash DFLASH_TOKENS=7 LOOKUP=1 FA2_FP8KV=0 DYNAMIC_K= > "$T/dexp"
 check "0 same" "$(rc) $(cmp -s "$T/dexp" "$T/don" && echo same || echo differs)" \
-  "the measured drafting setup spelled out (DRAFT_METHOD=dflash DFLASH_TOKENS=7 LOOKUP=1, FA2_FP8KV=0) boots, same argv"
+  "the measured drafting setup spelled out (DRAFT_METHOD=dflash DFLASH_TOKENS=7 LOOKUP=1, FA2_FP8KV=0, DYNAMIC_K empty) boots, same argv"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 VISION=1 > /dev/null
 check 0 "$(rc)" "VISION=1 is accepted (untested on this arm, gotcha 63)"
 
@@ -151,6 +151,8 @@ refused "dflash2: DFLASH_TOKENS=15" "is measured at DFLASH_TOKENS=7 (an 8-token 
 refused "dflash2: DFLASH_TOKENS=3"  "is measured at DFLASH_TOKENS=7 (an 8-token verify block); DFLASH_TOKENS=3" \
   SPEC=dflash2 CTX=long PTH_FA=1 DFLASH_TOKENS=3
 refused "dflash2: LOOKUP=0"         "LOOKUP=0 is untested on this" SPEC=dflash2 CTX=long PTH_FA=1 LOOKUP=0
+refused "dflash2: DYNAMIC_K"        "measured with a fixed verify block of 8 tokens; DYNAMIC_K=[[1,3,7],[4,512,3]]" \
+  SPEC=dflash2 CTX=long PTH_FA=1 DYNAMIC_K='[[1,3,7],[4,512,3]]'
 refused "PTH_FA=true"                         "PTH_FA=true: set it to 0 or 1" SPEC=mtp CTX=long PTH_FA=true
 refused "PTH_FA=2"                            "PTH_FA=2: set it to 0 or 1"    SPEC=mtp CTX=long PTH_FA=2
 run "$T/new" single-user/start_qwen.sh SPEC=mtp CTX=long PTH_FA=1 KV_OFFLOAD_GB=0 >/dev/null

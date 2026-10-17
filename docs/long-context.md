@@ -339,8 +339,9 @@ split-KV verify gate skips the drafter's windowed layers (`patches/spec-decode-i
 changes nothing here. Nothing else in the argv or the environment changes (`bench/test_pthfa_knob.sh`
 checks it). Refused at startup, besides the mtp arm's refusals: a drafting setup other than the measured
 one, i.e. `DRAFT_METHOD` other than `dflash` (DSpark is another drafter), `DFLASH_TOKENS` other than 7
-(it changes the target's verify block, and above 7 makes its length adaptive), and `LOOKUP=0`. `VISION=1`
-is accepted and untested on this arm (gotcha 63).
+(it changes the target's verify block, and above 7 makes its length adaptive), `LOOKUP=0`, and `DYNAMIC_K`
+(a draft count per batch size, so the verify block's length varies with the batch). `VISION=1` is accepted
+and untested on this arm (gotcha 63).
 
 **Measured on two RTX 3080 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090:** the
 same box as above (Linux in a Proxmox LXC container, driver 615.71.09, PCIe without P2P). Capped

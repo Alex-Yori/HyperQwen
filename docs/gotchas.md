@@ -1515,7 +1515,8 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     the boot at the drafter's layers); `FA2_FP8KV=1`, the other knob that picks the dflash2 backend;
     and on dflash2 any drafting setup but the measured one: `DRAFT_METHOD` other than `dflash` (a
     different drafter), `DFLASH_TOKENS` other than 7 (a different verify block on the target, adaptive
-    in length above 7) and `LOOKUP=0`. `VISION=1` on dflash2 is accepted but untested: it adds the
+    in length above 7), `LOOKUP=0` and `DYNAMIC_K` (a draft count per batch size, which varies the verify
+    block). `VISION=1` on dflash2 is accepted but untested: it adds the
     vision tower, which does not run on this backend, and leaves the target's attention as it is
     (on mtp the measured shape has `VISION=1`). There are no tuning knobs: the library reads no
     environment variables, and its launch shape comes from a planner that is a pure function of the

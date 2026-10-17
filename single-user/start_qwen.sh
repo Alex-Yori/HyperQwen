@@ -280,11 +280,11 @@ fi
 # byte: the drafter autoselects TRITON_ATTN, as it does without the knob. VLLM_SPEC_DECODE_ATTN stays as
 # the arm sets it; on this arm only the drafter's Triton impl reads it, and its split-KV verify gate
 # skips the drafter's windowed layers (patches/spec-decode-int8-kv.patch). Only the measured drafting
-# setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or dflash), DFLASH_TOKENS unset or 7, and
-# LOOKUP unset or 1; anything else on this arm is refused. Capped 2x RTX 3080 20 GB at TP=2, vLLM
-# 0.31.0, this branch's image against main's image on TRITON_ATTN with the same cache, same sitting
-# (2026-10-17): 128k cold TTFT 122.5 s against 249.3 s, N=1 decode at 128k 108.1 against 58.9 tok/s,
-# accepted length 4.81 against 4.79 of 7 drafts, GSM8K 0.960 against 0.955 (docs/long-context.md).
+# setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or dflash), DFLASH_TOKENS unset or 7,
+# LOOKUP unset or 1 and DYNAMIC_K unset; anything else on this arm is refused. Capped 2x RTX 3080 20 GB
+# at TP=2, vLLM 0.31.0, this branch's image against main's image on TRITON_ATTN with the same cache, same
+# sitting (2026-10-17): 128k cold TTFT 122.5 s against 249.3 s, N=1 decode at 128k 108.1 against 58.9
+# tok/s, accepted length 4.81 against 4.79 of 7 drafts, GSM8K 0.960 against 0.955 (docs/long-context.md).
 PTH_FA=${PTH_FA:-0}
 PTH_SPEC_BACKEND=
 if [ "$PTH_FA" = 1 ]; then
@@ -315,6 +315,12 @@ if [ "$PTH_FA" = 1 ]; then
     if [ "${LOOKUP:-1}" != 1 ]; then
       echo "PTH_FA=1 on SPEC=dflash2 is measured with lookup drafting on; LOOKUP=$LOOKUP is untested on this" >&2
       echo "  backend. Unset LOOKUP, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ -n "${DYNAMIC_K:-}" ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with a fixed verify block of 8 tokens; DYNAMIC_K=$DYNAMIC_K sets the" >&2
+      echo "  draft count per batch size, which changes the query length per batch, untested on this backend." >&2
+      echo "  Unset DYNAMIC_K, or PTH_FA." >&2
       exit 1
     fi
   fi
