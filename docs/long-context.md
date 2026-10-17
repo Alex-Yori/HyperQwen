@@ -312,12 +312,12 @@ datapoint, and the `SKIP(by design)` guard on a non-sm8x card has not run on one
 The GPU checks are `bench/test_pthfa_attn.py` (kernel against an fp64 reference, a pool past block id
 2,383, CUDA-graph replay) and the README's field-test protocol with `PTH_FA=1`.
 
-### `SPEC=dflash2 CTX=long PTH_FA=1`: the target on the kernel, the drafter on `TRITON_ATTN`
+### `SPEC=dflash2 CTX=long PTH_FA=1`: the target and the drafter on the kernel
 
 `SPEC=dflash2 CTX=long` with `FA2_FP8KV=0` runs `int8_per_token_head` on `TRITON_ATTN` (see "DFlash2 past
 64k" above; on an 8.6 GPU the default is fp8 KV on FlashAttention-2), and its decode decays with context.
-`PTH_FA=1` keeps the int8 cache and moves the target's 16
-full-attention layers onto the kernel:
+`PTH_FA=1` keeps the int8 cache and moves both models onto the kernel: the target's 16 full-attention
+layers and the DFlash2 drafter's five sliding-window layers.
 
 ```bash
 SPEC=dflash2 CTX=long PTH_FA=1 bash single-user/start_qwen.sh
@@ -327,24 +327,33 @@ What that resolves to, the settings that matter (the full argv: `PRINT_ARGV=1`):
 
 ```
 --attention-backend CUSTOM --kv-cache-dtype int8_per_token_head
---speculative-config '{"method":"dflash","model":"<repo>/models/Qwen3.8-27B-DFlash2-W4A16","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
+--speculative-config '{"method":"dflash","model":"<repo>/models/Qwen3.8-27B-DFlash2-W4A16","num_speculative_tokens":7,"draft_sample_method":"probabilistic","attention_backend":"CUSTOM"}'
 ```
 
-**The speculative config carries no `attention_backend` on this arm, on purpose.** It is the arm's own,
-byte for byte. The DFlash2 drafter's five layers are sliding-window (2048) and non-causal, which the
-kernel does not serve (gotcha 63), and a drafter takes its backend only from the speculative config, so
-leaving it out lets vLLM autoselect `TRITON_ATTN` for the drafter exactly as on the arm without the knob;
-naming `CUSTOM` there would stop the boot at the drafter's layers. The boot log shows both selections:
-`Using AttentionBackendEnum.CUSTOM backend` for the target on each rank, then
-`Using TRITON_ATTN attention backend out of potential backends: ['TRITON_ATTN']` for the drafter.
-`VLLM_SPEC_DECODE_ATTN` stays the arm's 1: on this arm only the drafter's Triton impl reads it, and its
-split-KV verify gate skips the drafter's windowed layers (`patches/spec-decode-int8-kv.patch`), so it
-changes nothing here. Nothing else in the argv or the environment changes (`bench/test_pthfa_knob.sh`
-checks it). Refused at startup, besides the mtp arm's refusals: a drafting setup other than the measured
-one, i.e. `DRAFT_METHOD` other than `dflash` (DSpark is another drafter), `DFLASH_TOKENS` other than 7
-(it changes the target's verify block, and above 7 makes its length adaptive), `LOOKUP=0`, and `DYNAMIC_K`
-(a draft count per batch size, so the verify block's length varies with the batch). `VISION=1` is accepted
-and untested on this arm (gotcha 63).
+As on mtp, the `"attention_backend":"CUSTOM"` inside the speculative config is what puts the drafter on
+the kernel: a drafter takes its backend only from there. The speculative config is the arm's own with
+that one key appended; nothing else in the argv or the environment changes (`bench/test_pthfa_knob.sh`
+checks it, also against the parent branch's launcher, where the same line has no `attention_backend`
+and the drafter autoselects `TRITON_ATTN`). It names no `kv_cache_dtype`, so the drafter's cache keeps
+the target's `int8_per_token_head` (vLLM 0.31.0 overrides the drafter's dtype only when that key is set).
+
+**What the kernel serves for the drafter, and nothing more.** The drafter's layers are sliding-window
+(2048) and non-causal at head size 128, 32 query / 8 KV heads (16 / 4 per rank at TP=2), with 8 query
+tokens per request (the bonus token and 7 drafts): row `r` at position `p` sees keys
+`[max(0, p - 2047), min(L - 1, p + 2047)]`, the same mask vLLM's `TRITON_ATTN` applies to these layers.
+The kernel has windowed, non-causal variants at head size 128 only; a sliding window or non-causal layer
+at head size 64 or 256 is refused at backend selection, and ALiBi, sinks, soft cap, a bidirectional
+multimodal prefix and R-SWA stay refused (gotcha 63, `pthfa/tests/gate_test.py`). Blocks below a
+request's window, which vLLM points at its null block, are never read: the kernel starts each row tile's
+key range at the window's lower edge and zero-fills below it. The causal kernels the target runs compile
+to the same SASS as the previous pin's (pth-flash-attn's `tools/sass_diff.py`: 105 kernels identical,
+18 new, on sm80/86/89), so the target's half of this arm is the parent branch's kernel.
+`VLLM_SPEC_DECODE_ATTN` stays the arm's 1; with both models on `CUSTOM` nothing reads it (only the
+`FLASH_ATTN` and `TRITON_ATTN` impls do). Refused at startup, besides the mtp arm's refusals: a drafting
+setup other than the measured one, i.e. `DRAFT_METHOD` other than `dflash` (DSpark is another drafter),
+`DFLASH_TOKENS` other than 7 (it changes the target's verify block, and above 7 makes its length
+adaptive), `LOOKUP=0`, and `DYNAMIC_K` (a draft count per batch size, so the verify block's length varies
+with the batch). `VISION=1` is accepted and untested on this arm (gotcha 63).
 
 **On an 8.6 GPU `PTH_FA=1` overrides the FA2 default.** There an unset `FA2_FP8KV` resolves to 1 on this
 arm (fp8 KV on FlashAttention-2, above); with `PTH_FA=1` it stays 0, so the argv and the environment are
@@ -352,10 +361,14 @@ the ones above on every card the kernel serves, and the effective-config line re
 `FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6 default)`. An explicit `FA2_FP8KV=1` with `PTH_FA=1` is refused
 before either plugin is probed (`resolve_config.sh`); `FA2_FP8KV=0` is accepted.
 
-**Measured on two RTX 3080 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090:** the
-same box as above (Linux in a Proxmox LXC container, driver 615.71.09, PCIe without P2P). Capped
-state (220 W, 1905 MHz lock), vLLM 0.31.0, text-only, k=7 with lookup drafting on, `PREFIX_CACHE=1
-MAX_SEQS=2 MAX_LEN=262144 GPU_UTIL=0.94 NCCL_P2P_DISABLE=1` and
+**Boot log, this branch's image:** <pending> (expected: `Using AttentionBackendEnum.CUSTOM backend` for
+the target and for the drafter on each rank, FULL graphs for the target and the `dflash2` head).
+
+**Target on the kernel, drafter on `TRITON_ATTN` (the parent branch's setting), measured on two RTX 3080
+20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090:** the same box as above (Linux in a
+Proxmox LXC container, driver 615.71.09, PCIe without P2P). Capped state (220 W, 1905 MHz lock), vLLM
+0.31.0, text-only, k=7 with lookup drafting on, `PREFIX_CACHE=1 MAX_SEQS=2 MAX_LEN=262144 GPU_UTIL=0.94
+NCCL_P2P_DISABLE=1` and
 `EXTRA_ARGS="--tensor-parallel-size 2 --disable-custom-all-reduce --max-num-batched-tokens 8192 --long-prefill-token-threshold 1024"`.
 Checkpoints are the launcher's defaults: the target `models/Qwen3.8-27B-W4A16-AutoRound-fast`, which
 `prepare/fetch_fast_variant.py` assembles from `dbirks/Qwen3.8-27B-W4A16-AutoRound` (its shards, hardlinked)
@@ -363,14 +376,14 @@ and `syvai/qwen3.8-27b-3090-fast-variant` (int4-GPTQ lm_head and MTP module, dra
 drafter `models/Qwen3.8-27B-DFlash2-W4A16`, fetched by `prepare/fetch_dflash2.py` from
 `syvai/Qwen3.8-27B-DFlash2-W4A16`.
 
-Two sittings on 2026-10-17, in the morning (04:56-08:45 box time) and during the day (10:30-16:35), each with
-`main`'s image on `TRITON_ATTN` (the arm without the knob, built
-from 95ee3b6) as the same-sitting control, run first and repeated last for drift. Morning sitting: this
-branch's image built at 8b55d4a with `PTH_FA=1`. 8b55d4a is this branch before its last commit
-(a61f0a6), which adds refusals, tests and docs only: the argv of this arm and the `pthfa/` files are the
-same. Daytime sitting: the image built at a61f0a6, the same launch, to confirm the final commit. Distinct
-8k / 32k / 128k prompts (the same prompts in both), 256 tokens out, greedy; medians of 3 reps
-(8k: 5) unless the row says n; ratio `CUSTOM` / `TRITON_ATTN` of the same sitting, 95% CI in brackets:
+Two sittings on 2026-10-17, each with `main`'s image on `TRITON_ATTN` (the arm without the knob, built
+from 95ee3b6) as the same-sitting control, run first and repeated last for drift. First sitting: the
+parent branch's image built at 8b55d4a with `PTH_FA=1`. 8b55d4a is the parent branch before its last
+commit (a61f0a6), which adds refusals, tests and docs only: the argv of this arm and the `pthfa/` files
+are the same. Second sitting: the image built at a61f0a6, the same launch, to confirm the parent's final
+commit. Distinct 8k / 32k / 128k prompts (the same prompts in both sittings), 256 tokens out, greedy;
+medians of 3 reps (8k: 5) unless the row says n; ratio `CUSTOM` / `TRITON_ATTN` of the same sitting, 95%
+CI in brackets:
 
 | capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | 2026-10-17 morning: `TRITON_ATTN` (int8) | morning: `CUSTOM` target (`PTH_FA=1`, image at 8b55d4a) | morning: ratio | 2026-10-17 daytime: `TRITON_ATTN` (int8) | daytime: `CUSTOM` target (`PTH_FA=1`, image at a61f0a6) | daytime: ratio |
 |---|---|---|---|---|---|---|
@@ -447,7 +460,26 @@ kernel). One run per arm, no CIs. The corpus was a stand-in, this repo's markdow
 usual corpus was not on this box; the arms share it, absolute numbers are not comparable with other
 machines'.
 
-**Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm.
+**Target and drafter on the kernel (`PTH_FA=1` on this branch's image):** <pending>. Same box, state and
+launch shape as above, three arms back to back in one sitting: this branch's image with `PTH_FA=1`, the
+parent branch's image with `PTH_FA=1` (target only), and this branch's image with `PTH_FA` unset
+(`TRITON_ATTN`, the control).
+
+| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | `TRITON_ATTN` (int8, knob unset) | `CUSTOM` target only (parent branch) | `CUSTOM` target and drafter (`PTH_FA=1`) | both / target only | both / `TRITON_ATTN` |
+|---|---|---|---|---|---|
+| TTFT 128k cold / 32k warm / 8k warm | <pending> | <pending> | <pending> | <pending> | <pending> |
+| 1 stream decode at 128k / 32k / 8k | <pending> | <pending> | <pending> | <pending> | <pending> |
+| ms per forward pass, same | <pending> | <pending> | <pending> | <pending> | <pending> |
+| 2 streams, per stream, same | <pending> | <pending> | <pending> | <pending> | <pending> |
+| 2-stream pair TTFT at 128k | <pending> | <pending> | <pending> | <pending> | <pending> |
+| accepted length per draft (of 7), GSM8K window | <pending> | <pending> | <pending> | <pending> | <pending> |
+| GSM8K n=200, greedy | <pending> | <pending> | <pending> | <pending> | <pending> |
+| KV pool at `MAX_LEN=262144` | <pending> | <pending> | <pending> | <pending> | <pending> |
+
+**Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm. The
+drafter-side kernel check is part 4 of `bench/test_pthfa_attn.py` (the drafter's shapes, windowed and
+non-causal, against an fp64 reference, including blocks below the window on vLLM's null block):
+<pending> on this branch's image.
 
 ## DFlash2 at 240k: `CTX=huge` (KVarN) also combines with `SPEC=dflash2`
 

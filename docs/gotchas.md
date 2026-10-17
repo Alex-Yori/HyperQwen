@@ -1496,35 +1496,40 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
 63. **`PTH_FA=1` is two arms and one cache, and an explicit `CUSTOM` it cannot serve fails at load,
     not quietly.** The pth-flash-attn backend (`pthfa/`, `docs/long-context.md`) serves exactly
     `--kv-cache-dtype int8_per_token_head` on compute capability 8.0, 8.6 and 8.9 (A100/A30/CMP
-    170HX, RTX 30xx, RTX 40xx), head sizes 64, 128 and 256, causal decoder self-attention without
-    sliding window, ALiBi, attention sinks or a logits soft cap, and no DCP/PCP. The library carries
+    170HX, RTX 30xx, RTX 40xx), head sizes 64, 128 and 256, decoder self-attention without ALiBi,
+    attention sinks, a logits soft cap, a bidirectional multimodal prefix or R-SWA, and no DCP/PCP.
+    Causal attention is served at all three head sizes; a sliding window and non-causal attention
+    only at head size 128, the shape of the DFlash2 drafter's five layers (window 2048, non-causal,
+    8 query tokens per request; the windowed kernels exist for D = 128 only). The library carries
     SASS for those three archs and no PTX, so an sm90 or sm120 card is refused rather than
     JIT-compiled into something nobody measured. Outside the list, an explicit
-    `--attention-backend CUSTOM` stops at model load with `pth_flash_attn does not support: <what>`
+    `--attention-backend CUSTOM` stops at model load with `pth_flash_attn does not support: <what>`,
+    and a sliding window or non-causal layer at head size 64 or 256 is refused at backend selection
+    with `... at head size <D> (the windowed kernels exist for D = 128 only)`
     (`pthfa/tests/gate_test.py` checks each reason); nothing ever selects `CUSTOM` on its own, so
     an arm that does not ask for it cannot reach it. That is why the knob is gated to
-    `SPEC=mtp CTX=long` and `SPEC=dflash2 CTX=long`, and why on dflash2 the target runs `CUSTOM` and
-    the drafter `TRITON_ATTN`: the DFlash2 drafter's five layers are sliding-window and non-causal,
-    outside the list, so the knob leaves the speculative config as the arm writes it, with no
-    `attention_backend`, and vLLM autoselects `TRITON_ATTN` for the drafter exactly as without the
-    knob. The other arms are not measured. Refused rather than combined, all untested here: a KV
+    `SPEC=mtp CTX=long` and `SPEC=dflash2 CTX=long`. On both, the target and the drafter run
+    `CUSTOM`: a drafter takes its backend from the speculative config, so the knob writes
+    `"attention_backend":"CUSTOM"` there as well as `--attention-backend CUSTOM`. It writes no
+    `kv_cache_dtype` into the speculative config, so the drafter's cache keeps the target's
+    `int8_per_token_head` (vLLM 0.31.0 overrides the drafter's dtype only when that key is set).
+    The other arms are not measured. Refused rather than combined, all untested here: a KV
     offload tier (`KV_OFFLOAD_GB`); `--attention-backend`, `--kv-cache-dtype` or
-    `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets (on
-    mtp the speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and
-    dropping it puts the MTP layer on another backend, while on dflash2 a `CUSTOM` there would stop
-    the boot at the drafter's layers); an explicit `FA2_FP8KV=1`, the other knob that picks the dflash2
-    backend (an unset one, which defaults to 1 on that arm on a compute capability 8.6 GPU, is overridden:
-    `PTH_FA=1` keeps it at 0, and the effective-config line reads `FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6
-    default)`);
-    and on dflash2 any drafting setup but the measured one: `DRAFT_METHOD` other than `dflash` (a
-    different drafter), `DFLASH_TOKENS` other than 7 (a different verify block on the target, adaptive
-    in length above 7), `LOOKUP=0` and `DYNAMIC_K` (a draft count per batch size, which varies the verify
-    block). `VISION=1` on dflash2 is accepted but untested: it adds the
-    vision tower, which does not run on this backend, and leaves the target's attention as it is
-    (on mtp the measured shape has `VISION=1`). There are no tuning knobs: the library reads no
-    environment variables, and its launch shape comes from a planner that is a pure function of the
-    batch descriptor. The numbers so far are from one box, two RTX 3080 20 GB at TP=2, on vLLM 0.30.0
-    and 0.31.0; on any other card they are still owed (`docs/long-context.md` says which).
+    `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets (the
+    speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and dropping it
+    puts the drafter on another backend); an explicit `FA2_FP8KV=1`, the other knob that picks the
+    dflash2 backend (an unset one, which defaults to 1 on that arm on a compute capability 8.6 GPU, is
+    overridden: `PTH_FA=1` keeps it at 0, and the effective-config line reads `FA2_FP8KV=0 (PTH_FA=1
+    overrides the 8.6 default)`); and on dflash2 any drafting setup but the measured one: `DRAFT_METHOD` other than
+    `dflash` (a different drafter), `DFLASH_TOKENS` other than 7 (a different verify block on the
+    target, adaptive in length above 7), `LOOKUP=0` and `DYNAMIC_K` (a draft count per batch size,
+    which varies the verify block). `VISION=1` on dflash2 is accepted but
+    untested: it adds the vision tower, which does not run on this backend, and leaves the target's
+    attention as it is (on mtp the measured shape has `VISION=1`). There are no tuning knobs: the
+    library reads no environment variables, and its launch shape comes from a planner that is a pure
+    function of the batch descriptor and, for a windowed layer, its window. The numbers so far are
+    from one box, two RTX 3080 20 GB at TP=2, on vLLM 0.30.0 and 0.31.0; on any other card they are
+    still owed (`docs/long-context.md` says which).
 64. **On vLLM 0.31.0 at `GPU_UTIL=0.94`, `prompt_logprobs=10` on a 32k prompt kills the engine with a
     CUDA OOM, whatever the attention backend.** The V2 runner computes prompt logprobs in chunks of
     1024 tokens and all-gathers each chunk's logits over the full vocabulary
