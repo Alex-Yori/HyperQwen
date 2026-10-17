@@ -37,6 +37,8 @@ jobs:
         run: bash bench/test_kv_offload_knob.sh
       - name: Check DYNAMIC_K reaches --speculative-config in single-user/start_qwen.sh, and its refusals
         run: bash bench/test_dynamic_k_knob.sh
+      - name: Check the launchers read -tp=N, any whitespace and _ in --flag names the way vLLM does
+        run: bash bench/test_tp_size.sh
       - name: Check each launcher refuses a boolean knob that is neither 0 nor 1 (#310)
         run: bash bench/test_bool_knobs.sh
       - name: Check the dflash2 seat note against the measured pools and resident counts
