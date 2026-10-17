@@ -1493,7 +1493,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     (upstream #51787; the series' `vllm-pr61050-lru-running-prefix` keeps the
     first chunks, `docs/vllm-0.31.md` has the numbers), so size it above
     what it holds.
-63. **`PTH_FA=1` is one arm and one cache, and an explicit `CUSTOM` it cannot serve fails at load,
+63. **`PTH_FA=1` is two arms and one cache, and an explicit `CUSTOM` it cannot serve fails at load,
     not quietly.** The pth-flash-attn backend (`pthfa/`, `docs/long-context.md`) serves exactly
     `--kv-cache-dtype int8_per_token_head` on compute capability 8.0, 8.6 and 8.9 (A100/A30/CMP
     170HX, RTX 30xx, RTX 40xx), head sizes 64, 128 and 256, causal decoder self-attention without
@@ -1503,12 +1503,16 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     `--attention-backend CUSTOM` stops at model load with `pth_flash_attn does not support: <what>`
     (`pthfa/tests/gate_test.py` checks each reason); nothing ever selects `CUSTOM` on its own, so
     an arm that does not ask for it cannot reach it. That is why the knob is gated to
-    `SPEC=mtp CTX=long`: the DFlash2 drafter's five sliding-window layers are outside the list, and
-    the other arms are not measured. Two settings are refused rather than combined, both untested
-    here: a KV offload tier (`KV_OFFLOAD_GB`), and `--attention-backend`, `--kv-cache-dtype` or
-    `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets; the
-    speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and dropping it
-    puts the MTP layer on another backend. There are no tuning knobs: the library reads no
+    `SPEC=mtp CTX=long` and `SPEC=dflash2 CTX=long`, and why on dflash2 the target runs `CUSTOM` and
+    the drafter `TRITON_ATTN`: the DFlash2 drafter's five layers are sliding-window and non-causal,
+    outside the list, so the knob leaves the speculative config as the arm writes it, with no
+    `attention_backend`, and vLLM autoselects `TRITON_ATTN` for the drafter exactly as without the
+    knob. The other arms are not measured. Two settings are refused rather than combined, both
+    untested here: a KV offload tier (`KV_OFFLOAD_GB`), and `--attention-backend`, `--kv-cache-dtype`
+    or `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets; on
+    mtp the speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and
+    dropping it puts the MTP layer on another backend, while on dflash2 a `CUSTOM` there would stop
+    the boot at the drafter's layers. There are no tuning knobs: the library reads no
     environment variables, and its launch shape comes from a planner that is a pure function of the
     batch descriptor. The numbers so far are from one box, two RTX 3080 20 GB at TP=2, on vLLM 0.30.0
     and 0.31.0; on any other card they are still owed (`docs/long-context.md` says which).
