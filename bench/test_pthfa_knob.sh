@@ -9,7 +9,8 @@
 # mode warns and ignores it. Copies
 # the checkout, without its own venv, to a temp dir and runs the launchers against a stub vllm (prints its argv,
 # then "@@ENV" and its VLLM_* environment) and a stub venv python (answers the install probe from
-# PTHFA_STUB_INSTALLED, and passes anything else to python3). No GPU, no model, no network.
+# PTHFA_STUB_INSTALLED, accepts the FA2 fp8 plugin's probe, and passes anything else to python3). No GPU, no model,
+# no network.
 #
 #   bash bench/test_pthfa_knob.sh
 #   PTHFA_BASE_TREE=<checkout without pthfa> bash bench/test_pthfa_knob.sh
@@ -31,7 +32,7 @@ stage() {
   mkdir -p "$2/venv/bin" "$2/models/Qwen3.8-27B-DFlash2-W4A16"
   : > "$2/models/Qwen3.8-27B-DFlash2-W4A16/model.safetensors"
   printf '#!/bin/sh\nprintf "%%s\\n" "$@"\necho @@ENV\nenv | grep "^VLLM_" | sort\n' > "$2/venv/bin/vllm"
-  printf '#!/bin/sh\ncase "$*" in *pth_flash_attn*) [ "${PTHFA_STUB_INSTALLED:-1}" = 1 ]; exit $? ;; esac\nexec python3 "$@"\n' > "$2/venv/bin/python"
+  printf '#!/bin/sh\ncase "$*" in *pth_flash_attn*) [ "${PTHFA_STUB_INSTALLED:-1}" = 1 ]; exit $? ;; *fa2_fp8kv*) exit 0 ;; esac\nexec python3 "$@"\n' > "$2/venv/bin/python"
   chmod +x "$2/venv/bin/vllm" "$2/venv/bin/python"
 }
 stage "$REPO" "$T/new"
@@ -114,6 +115,11 @@ echo "== refused (exit 1, with the refusal's own message on stderr)"
 # refusal's own text, never just "PTH_FA": the effective-config block prints PTH_FA=1 before any refusal.
 refused() { local why=$1 msg=$2; shift 2; run "$T/new" single-user/start_qwen.sh "$@" >/dev/null
   if [ "$(rc)" = 1 ] && grep -qF -- "$msg" "$T/err"; then check 1 1 "$why"; else check "1 ($msg)" "$(rc)" "$why"; fi; }
+# refused_either <why> <fragment> <other fragment> <env...>: as refused, with either fragment on stderr. For
+# FA2_FP8KV=1 on mtp: with #317 merged, its resolve_config.sh refuses that SPEC first, with its own message.
+refused_either() { local why=$1 msg=$2 alt=$3; shift 3; run "$T/new" single-user/start_qwen.sh "$@" >/dev/null
+  if [ "$(rc)" = 1 ] && { grep -qF -- "$msg" "$T/err" || grep -qF -- "$alt" "$T/err"; }; then check 1 1 "$why"
+  else check "1 ($msg | $alt)" "$(rc)" "$why"; fi; }
 GATE="is a SPEC=mtp CTX=long or SPEC=dflash2 CTX=long setting"
 XARGS="sets --attention-backend, --kv-cache-dtype and the speculative config itself"
 KVC="PTH_FA=1 with a KV connector"
@@ -130,7 +136,8 @@ refused "EXTRA_ARGS --speculative-config"     "$XARGS" SPEC=mtp CTX=long PTH_FA=
 refused "KV_OFFLOAD_GB=8"                     "$KVC"   SPEC=mtp CTX=long PTH_FA=1 KV_OFFLOAD_GB=8
 refused "EXTRA_ARGS --kv-offloading-size"     "$KVC"   SPEC=mtp CTX=long PTH_FA=1 EXTRA_ARGS="--kv-offloading-size 4"
 refused "no pth_flash_attn in the venv"       "$INST"  SPEC=mtp CTX=long PTH_FA=1 PTHFA_STUB_INSTALLED=0
-refused "FA2_FP8KV=1 alongside it"            "$FA2"   SPEC=mtp CTX=long PTH_FA=1 FA2_FP8KV=1
+refused_either "FA2_FP8KV=1 alongside it"     "$FA2" "FA2_FP8KV=1 runs only on SPEC=dflash2 CTX=long" \
+  SPEC=mtp CTX=long PTH_FA=1 FA2_FP8KV=1
 refused "dflash2: EXTRA_ARGS --attention-backend"  "$XARGS" SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--attention-backend TRITON_ATTN"
 refused "dflash2: EXTRA_ARGS --kv-cache-dtype"     "$XARGS" SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--kv-cache-dtype=int8_per_token_head"
 refused "dflash2: EXTRA_ARGS --speculative-config" "$XARGS" SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--speculative-config {}"
