@@ -42,8 +42,9 @@
 #   Triton, and KV_OFFLOAD_GB or another GPU turns the default off. See the arm below.
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/), 200k context with MTP, at roughly
 #   half the decode rate past 100k — see below and docs/long-context.md.
-# PTH_FA=1 (SPEC=mtp CTX=long only, default 0): int8 per-token-head KV read by the pth-flash-attn
-#   kernel (pthfa/) on the target and the MTP drafter, instead of fp8 on FlashInfer — see below.
+# PTH_FA=1 (SPEC=mtp CTX=long and SPEC=dflash2 CTX=long only, default 0): int8 per-token-head KV read
+#   by the pth-flash-attn kernel (pthfa/), on the target and the MTP drafter instead of fp8 on FlashInfer,
+#   or on the DFlash2 target instead of TRITON_ATTN (its drafter stays there) — see below.
 #
 # Fast variant: MODEL defaults to models/Qwen3.8-27B-W4A16-AutoRound-fast when it
 # exists (int4-GPTQ lm_head + MTP, own-output draft vocab; drafter/README.md), else
@@ -273,14 +274,24 @@ fi
 # cache: 128k TTFT 129 s against 250 s, N=1 decode at 128k 85-92 against 46 tok/s, MTP tokens per step
 # and GSM8K unchanged (docs/long-context.md has the table, the hardware and the launch line; gotcha 63 the
 # limits). Default 0: unset, the argv and the environment are those of the arm without it.
+# SPEC=dflash2 CTX=long: the arm's own int8_per_token_head cache, read by the kernel on the target only.
+# The DFlash2 drafter's five layers are sliding-window and non-causal, which the kernel does not serve
+# (gotcha 63), so its speculative config gets no attention_backend and stays the arm's own, byte for
+# byte: the drafter autoselects TRITON_ATTN, as it does without the knob. VLLM_SPEC_DECODE_ATTN stays as
+# the arm sets it; it reaches only the Triton impl, whose split-KV verify gate skips the drafter's
+# windowed layers (patches/spec-decode-int8-kv.patch). Capped 2x RTX 3080 20 GB at TP=2, vLLM 0.31.0,
+# against TRITON_ATTN on the same cache: 128k TTFT 123.7 s against 251.7 s, N=1 decode at 128k 106.7
+# against 58.3 tok/s, accepted length 4.81 of 7 drafts on both, GSM8K 0.965 against 0.955.
 PTH_FA=${PTH_FA:-0}
 PTH_SPEC_BACKEND=
 if [ "$PTH_FA" = 1 ]; then
-  if [ "$SPEC" != mtp ] || [ "$CTX" != long ]; then
-    echo "PTH_FA=1 is a SPEC=mtp CTX=long setting (got SPEC=$SPEC CTX=$CTX); refusing rather than" >&2
-    echo "  booting an arm it was not measured on. Unset PTH_FA, or set SPEC=mtp CTX=long." >&2
-    exit 1
-  fi
+  case "$SPEC/$CTX" in
+    mtp/long|dflash2/long) ;;
+    *)
+      echo "PTH_FA=1 is a SPEC=mtp CTX=long or SPEC=dflash2 CTX=long setting (got SPEC=$SPEC CTX=$CTX);" >&2
+      echo "  refusing rather than booting an arm it was not measured on. Unset PTH_FA, or set one of those." >&2
+      exit 1 ;;
+  esac
   case " ${EXTRA_ARGS:-} " in
     *" --attention-backend"*|*" --kv-cache-dtype"*|*" --speculative-config"*)
       echo "PTH_FA=1 sets --attention-backend, --kv-cache-dtype and the speculative config itself;" >&2
@@ -299,8 +310,13 @@ sys.exit(0 if s and os.path.isfile(os.path.join(s.submodule_search_locations[0],
     exit 1
   }
   ATTN_ARGS="--attention-backend CUSTOM --kv-cache-dtype int8_per_token_head"
-  PTH_SPEC_BACKEND=',"attention_backend":"CUSTOM"'
-  echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and MTP drafter" >&2
+  if [ "$SPEC" = mtp ]; then
+    PTH_SPEC_BACKEND=',"attention_backend":"CUSTOM"'
+    echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and MTP drafter" >&2
+  else
+    echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target only; the DFlash2" >&2
+    echo "  drafter stays on TRITON_ATTN (autoselected): its sliding-window, non-causal layers are outside the kernel" >&2
+  fi
 elif [ "$PTH_FA" != 0 ]; then
   echo "PTH_FA=$PTH_FA: set it to 0 or 1" >&2
   exit 1

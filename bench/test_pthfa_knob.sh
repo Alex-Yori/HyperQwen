@@ -1,16 +1,18 @@
 #!/bin/bash
-# CPU test for PTH_FA (single-user/start_qwen.sh, resolve_config.sh): unset, 0 and empty give the same argv and
-# stderr on every single-user arm; PTH_FA=1 on SPEC=mtp CTX=long puts the target AND the MTP drafter on the
-# CUSTOM backend with an int8_per_token_head cache and changes nothing else in the argv; every other arm, a
-# conflicting EXTRA_ARGS, a KV connector, a missing install and a value other than 0/1 are refused; batch mode
-# warns and ignores it. Copies the checkout, without its own venv, to a temp dir and runs the launchers against a
-# stub vllm (prints its argv) and a stub venv python (answers the install probe from PTHFA_STUB_INSTALLED, and
-# passes anything else to python3). No GPU, no model, no network.
+# CPU test for PTH_FA (single-user/start_qwen.sh, resolve_config.sh): unset, 0 and empty give the same argv,
+# VLLM_* environment and stderr on every single-user arm; PTH_FA=1 on SPEC=mtp CTX=long puts the target AND the
+# MTP drafter on the CUSTOM backend with an int8_per_token_head cache, and on SPEC=dflash2 CTX=long the target
+# only, with the arm's speculative config byte for byte (the DFlash2 drafter autoselects TRITON_ATTN); neither
+# changes anything else in the argv or the VLLM_* environment; every other arm, a conflicting EXTRA_ARGS, a KV
+# connector, a missing install and a value other than 0/1 are refused; batch mode warns and ignores it. Copies
+# the checkout, without its own venv, to a temp dir and runs the launchers against a stub vllm (prints its argv,
+# then "@@ENV" and its VLLM_* environment) and a stub venv python (answers the install probe from
+# PTHFA_STUB_INSTALLED, and passes anything else to python3). No GPU, no model, no network.
 #
 #   bash bench/test_pthfa_knob.sh
 #   PTHFA_BASE_TREE=<checkout without pthfa> bash bench/test_pthfa_knob.sh
-#       also compares every single-user and batch arm with PTH_FA unset against that tree's launchers, argv and
-#       stderr, byte for byte (the negative control against the tree this branch is cut from)
+#       also compares every single-user and batch arm with PTH_FA unset against that tree's launchers, argv,
+#       VLLM_* environment and stderr, byte for byte (the negative control against the tree this branch is cut from)
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; REPO="$(dirname "$HERE")"
 FAILS=0
@@ -23,12 +25,13 @@ stage() {
   (cd "$1" && tar --exclude=.git --exclude=./venv --exclude=docs/media --exclude=bench/demo --exclude=models -cf - .) | tar -xf - -C "$2"
   mkdir -p "$2/venv/bin" "$2/models/Qwen3.8-27B-DFlash2-W4A16"
   : > "$2/models/Qwen3.8-27B-DFlash2-W4A16/model.safetensors"
-  printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > "$2/venv/bin/vllm"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@"\necho @@ENV\nenv | grep "^VLLM_" | sort\n' > "$2/venv/bin/vllm"
   printf '#!/bin/sh\ncase "$*" in *pth_flash_attn*) [ "${PTHFA_STUB_INSTALLED:-1}" = 1 ]; exit $? ;; esac\nexec python3 "$@"\n' > "$2/venv/bin/python"
   chmod +x "$2/venv/bin/vllm" "$2/venv/bin/python"
 }
 stage "$REPO" "$T/new"
-# run <tree> <launcher> <env...>: argv on stdout (stub vllm), stderr in $T/err, exit code in $T/rc.
+# run <tree> <launcher> <env...>: argv and VLLM_* environment on stdout (stub vllm), stderr in $T/err, exit code
+# in $T/rc.
 # FA2_FP8KV=0: on a compute capability 8.6 host an unset knob resolves to 1 on SPEC=dflash2 CTX=long, and
 # the stub venv has no fa2 plugin, so that arm would refuse for a reason that has nothing to do with PTH_FA.
 run() { local tree=$1 sc=$2; shift 2
@@ -40,7 +43,7 @@ after() { local v; v=$(sed -n "/^$1\$/{n;p;}" | tr '\n' ' ' | sed 's/ $//'); ech
 ARMS=("SPEC=mtp CTX=fast" "SPEC=mtp CTX=long" "SPEC=mtp CTX=huge" "SPEC=dflash2 CTX=fast" "SPEC=dflash2 CTX=long"
       "SPEC=dflash2 CTX=huge" "SPEC=off CTX=long")
 
-echo "== unset, PTH_FA=0 and PTH_FA= give the same argv and stderr on every single-user arm"
+echo "== unset, PTH_FA=0 and PTH_FA= give the same argv, VLLM_* environment and stderr on every single-user arm"
 for arm in "${ARMS[@]}"; do
   run "$T/new" single-user/start_qwen.sh $arm > "$T/a"; cp "$T/err" "$T/a.err"; ra=$(rc)
   run "$T/new" single-user/start_qwen.sh $arm PTH_FA=0 > "$T/b"; cp "$T/err" "$T/b.err"
@@ -65,9 +68,34 @@ check "$spec_off" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d.p
 # Everything but the backend, the cache dtype and the speculative config is the arm's own argv.
 strip() { awk 'skip { skip = 0; next } /^--(attention-backend|kv-cache-dtype|speculative-config)$/ { skip = 1; next } { print }'; }
 check same "$(cmp -s <(strip < "$T/on") <(strip < "$T/off") && echo same || echo differs)" \
-  "every other argument unchanged (compilation config, graph sizes, max len, seqs)"
-grep -q '^\[effective-config\] PTH_FA=1' "$T/on.err" && check 1 1 "the effective config names it" || check 1 0 "the effective config names it"
+  "every other argument and VLLM_* variable unchanged (compilation config, graph sizes, max len, seqs)"
+grep -q '^\[effective-config\] PTH_FA=1 .*target and MTP drafter' "$T/on.err" && check 1 1 "the effective config names it" \
+  || check 1 0 "the effective config names it"
 run "$T/new" single-user/start_qwen.sh SPEC=mtp CTX=long PTH_FA=1 EXTRA_ARGS="--tensor-parallel-size 2 --disable-custom-all-reduce" > "$T/tp"
+check "0 2" "$(rc) $(after --tensor-parallel-size < "$T/tp")" "TP=2 through EXTRA_ARGS boots"
+
+echo "== PTH_FA=1, SPEC=dflash2 CTX=long: the target only, the DFlash2 drafter's speculative config untouched"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long > "$T/doff"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 > "$T/don"; cp "$T/err" "$T/don.err"
+check 0 "$(rc)" "boots"
+check CUSTOM "$(after --attention-backend < "$T/don")" "--attention-backend CUSTOM, once"
+check int8_per_token_head "$(after --kv-cache-dtype < "$T/don")" "--kv-cache-dtype int8_per_token_head, once"
+check "TRITON_ATTN int8_per_token_head" "$(after --attention-backend < "$T/doff") $(after --kv-cache-dtype < "$T/doff")" \
+  "(control: the arm without it runs TRITON_ATTN on the same cache dtype)"
+dspec_off=$(after --speculative-config < "$T/doff")
+check "$dspec_off" "$(after --speculative-config < "$T/don")" \
+  "the speculative config is byte-equal to the arm's own (no attention_backend: the drafter autoselects)"
+check "dflash None" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d["method"], d.get("attention_backend"))' "$dspec_off" 2>&1)" \
+  "(control: the arm's own speculative config names no drafter backend)"
+check "1 1" "$(sed -n 's/^VLLM_SPEC_DECODE_ATTN=//p' < "$T/don") $(sed -n 's/^VLLM_SPEC_DECODE_ATTN=//p' < "$T/doff")" \
+  "VLLM_SPEC_DECODE_ATTN stays the arm's 1"
+check same "$(cmp -s <(strip < "$T/don") <(strip < "$T/doff") && echo same || echo differs)" \
+  "every other argument and VLLM_* variable unchanged (compilation config, graph sizes, max len, seqs)"
+grep -q '^\[effective-config\] PTH_FA=1 .*target only, the DFlash2 drafter stays on TRITON_ATTN' "$T/don.err" \
+  && check 1 1 "the effective config names it, target only" || check 1 0 "the effective config names it, target only"
+grep -q '^\[start_qwen\] PTH_FA=1: .*target only; the DFlash2' "$T/don.err" \
+  && check 1 1 "the launcher says the drafter stays on TRITON_ATTN" || check 1 0 "the launcher says the drafter stays on TRITON_ATTN"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--tensor-parallel-size 2 --disable-custom-all-reduce" > "$T/tp"
 check "0 2" "$(rc) $(after --tensor-parallel-size < "$T/tp")" "TP=2 through EXTRA_ARGS boots"
 
 echo "== refused (exit 1, with the reason on stderr)"
@@ -75,7 +103,8 @@ refused() { local why=$1; shift; run "$T/new" single-user/start_qwen.sh "$@" >/d
   if [ "$(rc)" = 1 ] && grep -q "PTH_FA" "$T/err"; then check 1 1 "$why"; else check "1 (PTH_FA named)" "$(rc)" "$why"; fi; }
 refused "SPEC=mtp CTX=fast"                   SPEC=mtp CTX=fast PTH_FA=1
 refused "SPEC=mtp CTX=huge"                   SPEC=mtp CTX=huge PTH_FA=1
-refused "SPEC=dflash2 CTX=long"               SPEC=dflash2 CTX=long PTH_FA=1
+refused "SPEC=dflash2 CTX=fast"               SPEC=dflash2 CTX=fast PTH_FA=1
+refused "SPEC=dflash2 CTX=huge"               SPEC=dflash2 CTX=huge PTH_FA=1
 refused "SPEC=off CTX=long"                   SPEC=off CTX=long PTH_FA=1
 refused "EXTRA_ARGS --attention-backend"      SPEC=mtp CTX=long PTH_FA=1 EXTRA_ARGS="--attention-backend TRITON_ATTN"
 refused "EXTRA_ARGS --kv-cache-dtype"         SPEC=mtp CTX=long PTH_FA=1 EXTRA_ARGS="--kv-cache-dtype=fp8"
@@ -83,10 +112,18 @@ refused "EXTRA_ARGS --speculative-config"     SPEC=mtp CTX=long PTH_FA=1 EXTRA_A
 refused "KV_OFFLOAD_GB=8"                     SPEC=mtp CTX=long PTH_FA=1 KV_OFFLOAD_GB=8
 refused "EXTRA_ARGS --kv-offloading-size"     SPEC=mtp CTX=long PTH_FA=1 EXTRA_ARGS="--kv-offloading-size 4"
 refused "no pth_flash_attn in the venv"       SPEC=mtp CTX=long PTH_FA=1 PTHFA_STUB_INSTALLED=0
+refused "dflash2: EXTRA_ARGS --attention-backend"  SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--attention-backend TRITON_ATTN"
+refused "dflash2: EXTRA_ARGS --kv-cache-dtype"     SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--kv-cache-dtype=int8_per_token_head"
+refused "dflash2: EXTRA_ARGS --speculative-config" SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--speculative-config {}"
+refused "dflash2: KV_OFFLOAD_GB=8"                 SPEC=dflash2 CTX=long PTH_FA=1 KV_OFFLOAD_GB=8
+refused "dflash2: EXTRA_ARGS --kv-transfer-config" SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--kv-transfer-config {}"
+refused "dflash2: no pth_flash_attn in the venv"   SPEC=dflash2 CTX=long PTH_FA=1 PTHFA_STUB_INSTALLED=0
 refused "PTH_FA=true"                         SPEC=mtp CTX=long PTH_FA=true
 refused "PTH_FA=2"                            SPEC=mtp CTX=long PTH_FA=2
 run "$T/new" single-user/start_qwen.sh SPEC=mtp CTX=long PTH_FA=1 KV_OFFLOAD_GB=0 >/dev/null
 check 0 "$(rc)" "KV_OFFLOAD_GB=0 is no tier: boots"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 KV_OFFLOAD_GB=0 >/dev/null
+check 0 "$(rc)" "dflash2: KV_OFFLOAD_GB=0 is no tier: boots"
 
 echo "== batch mode ignores it, and says so"
 run "$T/new" batch/start_qwen.sh > "$T/b0"
@@ -95,7 +132,7 @@ check "0 same" "$(rc) $(cmp -s "$T/b0" "$T/b1" && echo same || echo differs)" "b
 grep -q "PTH_FA=1 is set but batch mode ignores it" "$T/err" && check 1 1 "batch warns" || check 1 0 "batch warns"
 
 if [ -n "${PTHFA_BASE_TREE:-}" ]; then
-  echo "== negative control: PTH_FA unset against $PTHFA_BASE_TREE, argv and stderr byte for byte"
+  echo "== negative control: PTH_FA unset against $PTHFA_BASE_TREE, argv, VLLM_* environment and stderr byte for byte"
   stage "$PTHFA_BASE_TREE" "$T/base"
   for arm in "${ARMS[@]}" "PREFIX_CACHE=1 VISION=1 SPEC=mtp CTX=long" "SPEC=mtp CTX=long EXTRA_ARGS=--tensor-parallel-size=2"; do
     run "$T/base" single-user/start_qwen.sh $arm > "$T/x"; sed "s|$T/base|TREE|g" "$T/err" > "$T/x.err"
