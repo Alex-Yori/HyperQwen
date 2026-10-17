@@ -402,9 +402,8 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     a fresh server, one request, no warm-up, never collapses at any length
     ([#13](https://github.com/syv-ai/HyperQwen/pull/13), mjungnickel18) —
     which is also why `PREFIX_CACHE=0` always looked clean on vLLM 0.27.1, where it meant
-    no caching. Since 0.28 `PREFIX_CACHE=0` leaves vLLM's default caching on. The
-    **residue** decides whether a hit corrupts, and it is a clean function of the draft
-    count:
+    no caching, as it does again at HEAD. The **residue** decides whether a hit
+    corrupts, and it is a clean function of the draft count:
 
     | config | k | verify block L=k+1 | attention block | broken R | free slots 128-R |
     |---|---|---|---|---|---|
@@ -440,12 +439,13 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     costs nothing measurable — `SPEC=mtp` over 8k/16k/32k/50k is 87.8/86.1/70.4/63.5
     tok/s captured against 93.5/83.8/70.3/59.6 piecewise. This repo previously scoped
     that workaround to `dflash2` on the theory that MTP's short verify step captures
-    correctly; it does not, and `SPEC=mtp CTX=huge` shipped with the bug. With
-    `PREFIX_CACHE` unset the launcher sets no capture mode, so vLLM's default
-    `FULL_AND_PIECEWISE` runs with vLLM's default caching on. A sweep of all 128
-    residues there, at an 86% prefix-cache hit rate on vLLM 0.31, found 0 broken
-    (2026-10-17). That sweep ran the unset path only, so it does not lift the pin on
-    `PREFIX_CACHE=1`.
+    correctly; it does not, and `SPEC=mtp CTX=huge` shipped with the bug. Unset
+    `PREFIX_CACHE` means 1, so unset gets the pin too. A sweep of all 128 residues at
+    an 86% prefix-cache hit rate on vLLM 0.31 found 0 broken (2026-10-17), but it
+    measured the path unset ran before the launcher passed the flag both ways (vLLM's
+    default `FULL_AND_PIECEWISE` and caching, without the launcher's safeguards). It
+    does not lift the pin on `PREFIX_CACHE=1`. The pinned path itself, `CTX=huge
+    SPEC=mtp` with `PREFIX_CACHE` unset at HEAD, swept 0 of 128 broken on 0.31 too.
 
     `dflash2` has since got FULL capture back (`a75ee4b` fixed its residue, and
     `b356e31` swept **all 128** residues under FULL with 0 broken), so the two
@@ -1058,10 +1058,9 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     identified. On 0.31 (a 3090, 332-336k-token pool, 2026-10-17) the `--ppl-only`
     battery read 10.76 on English with caching off, with `PREFIX_CACHE` unset and
     with `PREFIX_CACHE=1`, three runs each. If it comes back on a later pin, compare
-    against caching off, which since vLLM 0.28 is
-    `EXTRA_ARGS=--no-enable-prefix-caching` rather than `PREFIX_CACHE=0`. Ordinary
-    generation was never implicated — needle retrieval and decode rates were normal
-    on the same server.
+    against caching off, which is `PREFIX_CACHE=0` again. Ordinary generation was
+    never implicated — needle retrieval and decode rates were normal on the same
+    server.
 47. **`DFLASH_TOKENS=15` asserted at engine start on the int4 path, because the
     drafter's promoted block only has to *cover* the primary page, not divide
     it.** Filed as

@@ -116,9 +116,10 @@ One line each; the rest of this page is the long version.
 9. **Prefix caching for a hybrid model, on purpose.** vLLM 0.27 kept it opt-in for
    mamba/GDN hybrids, and `PREFIX_CACHE=1` turned it on in both modes with the recurrent
    state resumed from the last cached block boundary. Since 0.28 vLLM turns it on by
-   default and `PREFIX_CACHE=0` keeps it. Against caching off on 0.27.1, follow-up chat
-   turns on a 24k document went 23 s → 1 s, and 64 API requests sharing a 5.8k system
-   prompt 222 s → 17 s.
+   default. The launcher passes the flag both ways, on for `PREFIX_CACHE=1` (the default)
+   and off for `PREFIX_CACHE=0`. Against caching off on 0.27.1, follow-up chat turns on a
+   24k document went 23 s → 1 s, and 64 API requests sharing a 5.8k system prompt
+   222 s → 17 s.
 
 ### int8 prefill for single-user mode (`INT8_ACT=int8`)
 
@@ -189,8 +190,8 @@ Things this campaign measured that did NOT pay, so nobody re-walks them:
 - **`PREFIX_CACHE=0` prefilled ~20% slower than `PREFIX_CACHE=1`** on vLLM 0.27.1, when
   `PREFIX_CACHE=0` meant caching off. (The control that added `--mamba-cache-mode align` to
   `PREFIX_CACHE=0` did not test align: with caching off, vLLM resets the mode to `none`.)
-  Since 0.28 `PREFIX_CACHE=0` runs caching in align mode too, and the gap has not been
-  re-measured. Do not turn caching off "for speed".
+  `PREFIX_CACHE=0` is caching off again, and the gap has not been re-measured since
+  0.27.1. Do not turn caching off "for speed".
 - **Bigger prefill chunks do not boot** under the pinned `KV_MEM`:
   `--max-num-batched-tokens` 4096 and 8192 both inflate the profiled
   activation peak past the transient floor (engine init fails). 2048 stays.
@@ -331,12 +332,11 @@ same server with `LOOKUP=0` (the two that differ are near-tie flips, gotcha 14).
 The mode also costs 4 request slots instead of 8 and 56k context instead of 64k, because
 `--mamba-cache-mode align` reserves recurrent-state pages per slot per speculative block.
 
-Pair it with prefix caching (vLLM's default since 0.28, which `PREFIX_CACHE=0` keeps and
-`PREFIX_CACHE=1` passes explicitly). Against caching off on 0.27.1, a follow-up turn on a
-24k-token document cost **~1 s instead of ~23 s** because the attention KV is reused and
-the recurrent state resumes from the last cached block boundary, for one extra state page
-per request. Prefill stops dominating a chat, and then drafting from the context is what
-makes the decode fast.
+Pair it with prefix caching (`PREFIX_CACHE=1`, the default). Against caching off on
+0.27.1, a follow-up turn on a 24k-token document cost **~1 s instead of ~23 s** because
+the attention KV is reused and the recurrent state resumes from the last cached block
+boundary, for one extra state page per request. Prefill stops dominating a chat, and then
+drafting from the context is what makes the decode fast.
 
 `PREFIX_CACHE=1` works in **batch mode** too, and matters just as much there: on 0.27.1, 64
 requests sharing one 5,820-token system prompt took 222 s with caching off and **16.9 s**

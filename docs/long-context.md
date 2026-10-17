@@ -295,12 +295,13 @@ swept **all 128** residues under FULL with 0 broken), so at HEAD
 `SPEC=dflash2 CTX=huge PREFIX_CACHE=1` runs captured. `SPEC=mtp CTX=huge PREFIX_CACHE=1`
 still forces PIECEWISE, and that one is a correctness constraint rather than a
 preference: under FULL it breaks at one prompt length in 128 and nobody has
-fixed it. With `PREFIX_CACHE` unset the launcher leaves vLLM's default capture, and
-since vLLM 0.28 caching is on there too. On 0.31 a sweep of all 128 residues on that
-unset path, at an 86% prefix-cache hit rate, found 0 broken (2026-10-17). It does not
-cover `PREFIX_CACHE=1`, so the pin stays there. In all three cases prefix caching is on,
-which is what the mode is for — turn 2 over a cached 100k document costs 4.7 s
-against 169 s cold.
+fixed it. Unset `PREFIX_CACHE` means 1, so unset gets PIECEWISE too. On 0.31 a sweep of
+all 128 residues found 0 broken at an 86% prefix-cache hit rate (2026-10-17), but it
+measured the path unset ran before the launcher passed the flag both ways (vLLM's
+default capture and caching, without the launcher's safeguards). It does not lift the
+pin. The pinned default path swept 0 of 128 broken on 0.31 as well (2026-10-17). In both
+cases prefix caching is on, which is what the mode is for — turn 2 over a
+cached 100k document costs 4.7 s against 169 s cold.
 
 `CUDAGRAPH_MODE=FULL_AND_PIECEWISE` overrides the MTP `PREFIX_CACHE=1` line for anyone
 hunting the root cause. Treat that as unsafe rather than merely slower.

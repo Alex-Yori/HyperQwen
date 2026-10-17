@@ -88,7 +88,7 @@ the prefix cache partially serve repeated bench prompts, which read one config
 Decode at C1 is unchanged by the int8 path (122±5 vs 121 tok/s over repeats);
 quality is the documented int8 trade
 ([docs/optimizations.md](../docs/optimizations.md), GSM8K 95.0 vs 96.5, PPL
-+4.1%). On vLLM 0.27.1, `SPEC=off` and `PREFIX_CACHE=0` (then caching off) each measured
++4.1%). On vLLM 0.27.1, `SPEC=off` and `PREFIX_CACHE=0` (caching off) each measured
 ~20% *slower* prefill than the dflash2 defaults — the drafter rides the V2 model runner and
 the prefix-cache path is the fast allocation path — so neither is a "lean" prefill
 configuration.
@@ -109,10 +109,8 @@ protocol people ask for: `SPEC=off PREFIX_CACHE=0`, 7,681-token prompts,
 requests, distinct seeds per call. PP = total prompt tokens / wall time of
 1-token-output runs at the same concurrency; TG = C × 1000 / mean TPOT
 (true tokens per second — with speculation off every round emits exactly one
-token per request). RTX 3090 at 250 W, this checkpoint (W4A16-AutoRound-fast), vLLM 0.27.1,
-when `PREFIX_CACHE=0` meant no prefix caching. Since vLLM 0.28 `PREFIX_CACHE=0` leaves
-vLLM's default prefix caching on, so to repeat these cells add
-`EXTRA_ARGS=--no-enable-prefix-caching`.
+token per request). RTX 3090 at 250 W, this checkpoint (W4A16-AutoRound-fast), vLLM 0.27.1.
+`PREFIX_CACHE=0` is caching off, as it was on 0.27.1.
 
 | cell | W4A16 raw: PP / TG-agg | + server-side int8 (`INT8_ACT=int8 PREFILL_ATTN=int8`): PP / TG-agg |
 |---|---|---|
@@ -135,11 +133,10 @@ comment), not raw decode. Raw single-stream decode for 16 GB of weights on a
 
 If every request carries the same system prompt, few-shot block or document — the normal
 shape of an API backend — you want prefix caching (`--enable-prefix-caching
---mamba-cache-mode align`). Since vLLM 0.28 vLLM turns it on by default for this model, so
-`PREFIX_CACHE=0` keeps it, `PREFIX_CACHE=1` passes the flags explicitly, and
-`EXTRA_ARGS=--no-enable-prefix-caching` turns it off. The attention KV of the shared
-prefix is reused and the recurrent (GDN) state resumes from the last cached block boundary,
-so the prefix is prefilled once instead of once per request:
+--mamba-cache-mode align`). `PREFIX_CACHE=1`, the default, passes those flags, and
+`PREFIX_CACHE=0` passes `--no-enable-prefix-caching` and turns it off. The attention KV
+of the shared prefix is reused and the recurrent (GDN) state resumes from the last cached
+block boundary, so the prefix is prefilled once instead of once per request:
 
 | 64 requests sharing a 5,820-token system prompt, concurrency 32 | wall | output | median latency | p90 |
 |---|---|---|---|---|
@@ -198,7 +195,7 @@ All overridable as env vars, defaults in the script:
 
 | var | default | notes |
 |---|---|---|
-| `PREFIX_CACHE` | 0 | 0 keeps vLLM's default, which since vLLM 0.28 is prefix caching on in align mode. 1 = pass the flags explicitly (see above): 13x on shared-prompt workloads against caching off on vLLM 0.27.1. `EXTRA_ARGS=--no-enable-prefix-caching` turns caching off |
+| `PREFIX_CACHE` | 1 | 1 = prefix caching on (`--enable-prefix-caching --mamba-cache-mode align`, see above), 13x on shared-prompt workloads against caching off on vLLM 0.27.1. 0 = `--no-enable-prefix-caching`, for raw-engine benchmarks, A/Bs that must not reuse a prefix, quality comparisons and debugging the cache path. It costs every follow-up turn and shared prompt a full prefill. Other values refuse to boot. The last `--enable-prefix-caching` / `--no-enable-prefix-caching` in `EXTRA_ARGS` wins |
 | `KV` | `fp8` | `kvarn` switches to the KVarN 4/2-bit KV cache (run `bash kvarn/install.sh` once): 262k context, ~2× the token pool, slower decode — see the main README's "262k context" section |
 | `INT8_ACT` | `int8` | int8 activations on the Marlin GEMMs (int8 tensor cores, weights stay int4). Empty string = plain W4A16 |
 | `INT8_LAYERS` | `mlp` | regex on the layer name that gets int8 activations. `gate_up` for the gentle variant, `.` for everything, or a hand-picked list from `bench/act_calib.py` |

@@ -1,7 +1,7 @@
 #!/bin/bash
 # CPU test for DYNAMIC_K (single-user/start_qwen.sh): set, it lands in the --speculative-config JSON as
 # num_speculative_tokens_per_batch_size with every other key unchanged, under SPEC=dflash2 and SPEC=mtp; unset or
-# empty changes nothing; SPEC=off ignores it with a warning; CTX=huge + PREFIX_CACHE=1 refuses it.
+# empty changes nothing; SPEC=off ignores it with a warning; CTX=huge with prefix caching on (PREFIX_CACHE unset or 1) refuses it.
 # Copies the checkout to a temp dir and runs the launcher against a stub vllm that prints its argv. No GPU, no
 # model, no network.
 #
@@ -59,5 +59,8 @@ out=$(launch SPEC=dflash2 CTX=huge PREFIX_CACHE=1 $D DYNAMIC_K="$K")
 check 1  "$(cat "$T/rc")"                                    "PREFIX_CACHE=1 DYNAMIC_K=$K: exit code"
 check yes "$(grep -q 'DYNAMIC_K refused' "$T/err" && echo yes || echo no)" "PREFIX_CACHE=1 DYNAMIC_K=$K: stderr names DYNAMIC_K"
 check ""  "$out"                                             "PREFIX_CACHE=1 DYNAMIC_K=$K: vllm not started"
-check "$K" "$(cfg SPEC=dflash2 CTX=huge $D DYNAMIC_K="$K" | field $KEY)" "PREFIX_CACHE unset, DYNAMIC_K=$K: $KEY"
+out=$(launch SPEC=dflash2 CTX=huge $D DYNAMIC_K="$K")
+check 1  "$(cat "$T/rc")"                                    "PREFIX_CACHE unset DYNAMIC_K=$K: exit code"
+check ""  "$out"                                             "PREFIX_CACHE unset DYNAMIC_K=$K: vllm not started"
+check "$K" "$(cfg SPEC=dflash2 CTX=huge PREFIX_CACHE=0 $D DYNAMIC_K="$K" | field $KEY)" "PREFIX_CACHE=0, DYNAMIC_K=$K: $KEY"
 echo; [ $FAILS = 0 ] && echo "all checks passed" || { echo "$FAILS checks FAILED"; exit 1; }

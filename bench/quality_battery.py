@@ -14,11 +14,11 @@ GPU_UTIL=0.93 for this (gotcha 10 in the README).
 On vLLM 0.28 and earlier, CTX=huge (KVarN) with SPEC=mtp and PREFIX_CACHE=1 corrupted
 prompt_logprobs: some requests 400 with "Out of range float values are not JSON
 compliant: nan", and the batteries that did complete read ~23% high on English
-(12.6-13.7 against 10.76) and drifted run to run. On 0.27.1, PREFIX_CACHE=0 (then
-caching off) made the same server exact and stable to four decimals. The 0.29 pin
-fixed it (#64, gotcha 46), and on 0.31 caching off, PREFIX_CACHE unset and
-PREFIX_CACHE=1 all read 10.76. If it comes back, compare against caching off, which
-since 0.28 is EXTRA_ARGS=--no-enable-prefix-caching rather than PREFIX_CACHE=0.
+(12.6-13.7 against 10.76) and drifted run to run. On 0.27.1, PREFIX_CACHE=0 (caching
+off) made the same server exact and stable to four decimals. The 0.29 pin fixed it
+(#64, gotcha 46), and on 0.31 caching off, PREFIX_CACHE unset and PREFIX_CACHE=1 all
+read 10.76. If it comes back, compare against caching off, which is PREFIX_CACHE=0
+again.
 SPEC=off, SPEC=dflash2 and CTX=fast were never affected, so the published quality
 tables are not implicated.
 Usage: python bench/quality_battery.py <tag> [--ppl-only] [--gsm-only] [--gsm-n 200]

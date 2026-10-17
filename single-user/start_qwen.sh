@@ -106,6 +106,7 @@ resolve_effective_config single
 qwen_check_bool_knobs
 # KV_OFFLOAD_GB=N: the CPU KV tier as a flag, ahead of everything below that reads EXTRA_ARGS.
 qwen_kv_offload_args
+qwen_prefix_cache
 qwen_kv_offload_shm_check
 
 source "$REPO/single-user/select_model.sh"
@@ -219,9 +220,10 @@ if [ "$SPEC" = "dflash2" ] && [ "$CTX" = "long" ]; then
   # patches/spec-decode-int8-kv.patch lets the split-KV verify kernel read the quantized
   # cache (vLLM's own Triton attention will not split KV for a multi-query verify, which
   # is every step here, and costs 7.4 ms per layer at 128k against this kernel's 1.3).
-  # Costs prefill: 251 s to load a 112k document against FLASH_ATTN's ~112 s. With
-  # PREFIX_CACHE=1 only the first turn pays it (5.9 s afterwards), which is why this is a
-  # mode for a RAG or coding front-end that loads a document once, not for general chat.
+  # Costs prefill: 251 s to load a 112k document against FLASH_ATTN's ~112 s. With prefix
+  # caching on (PREFIX_CACHE=1, the default) only the first turn pays it (5.9 s afterwards),
+  # which is why this is a mode for a RAG or coding front-end that loads a document once,
+  # not for general chat.
   ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype int8_per_token_head"
   export VLLM_SPEC_DECODE_ATTN=${SPEC_ATTN:-1}
 elif [ "$SPEC" = "dflash2" ] && [ "$CTX" = "huge" ]; then
@@ -297,8 +299,8 @@ if [ "$SPEC" = "dflash2" ]; then
   # series, above the adaptive path's own 14.29 cold. Root cause still open; this is a
   # correct and fast setting, not a workaround with a cost.
   if [ -z "${LOOKUP_ADAPTIVE:-}" ] && [ "$VLLM_DFLASH2_LOOKUP" = "1" ] && [ "$DRAFT_TOKENS" -gt 7 ] \
-     && [ "$CTX" = "huge" ] && [ "${PREFIX_CACHE:-0}" = "1" ]; then
-    echo "DFLASH_TOKENS>7 + CTX=huge + PREFIX_CACHE=1: pinning the verify block to" >&2
+     && [ "$CTX" = "huge" ] && [ "$PREFIX_CACHE_ON" = 1 ]; then
+    echo "DFLASH_TOKENS>7 + CTX=huge + prefix caching: pinning the verify block to" >&2
     echo "$((DRAFT_TOKENS + 1)) tokens (VLLM_DFLASH2_LOOKUP_ADAPTIVE=0). The adaptive length" >&2
     echo "corrupts the second turn over a shared prefix on the KVarN cache; pinned is both" >&2
     echo "correct and faster. LOOKUP_ADAPTIVE=1 asks for the adaptive path anyway." >&2
@@ -552,15 +554,15 @@ fi
 # DYNAMIC_K: on the reference 3090 at SPEC=dflash2 DFLASH_TOKENS=7, [[1,3,7],[4,512,3]] lifted decode at 4
 # streams +7.7%, +8.0% and +9.2% in three A/Bs, single-stream within 1%. It buys step time, not seats: the recurrent-state
 # pages are reserved for num_speculative_tokens, not the k a step runs at, so only a lower DFLASH_TOKENS buys
-# residents. Refused at CTX=huge + PREFIX_CACHE=1: a k that moves with the batch size is a verify length that
+# residents. Refused at CTX=huge with prefix caching on: a k that moves with the batch size is a verify length that
 # changes step to step, which the VLLM_DFLASH2_LOOKUP_ADAPTIVE comment above shows corrupts a prefix-cache hit.
 if [ -n "${DYNAMIC_K:-}" ]; then
   if [ -z "$SPEC_CFG" ]; then
     echo "[start_qwen] DYNAMIC_K ignored: SPEC=$SPEC has no speculative decoding to schedule." >&2
-  elif [ "$CTX" = "huge" ] && [ "${PREFIX_CACHE:-0}" = "1" ]; then
-    echo "DYNAMIC_K refused at CTX=huge + PREFIX_CACHE=1: a per-batch-size k changes the verify length when the" >&2
+  elif [ "$CTX" = "huge" ] && [ "$PREFIX_CACHE_ON" = 1 ]; then
+    echo "DYNAMIC_K refused at CTX=huge with prefix caching on: a per-batch-size k changes the verify length when the" >&2
     echo "  batch crosses a range, which corrupts a prefix-cache hit on the KVarN cache (see the" >&2
-    echo "  VLLM_DFLASH2_LOOKUP_ADAPTIVE comment in single-user/start_qwen.sh). Unset DYNAMIC_K or PREFIX_CACHE." >&2
+    echo "  VLLM_DFLASH2_LOOKUP_ADAPTIVE comment in single-user/start_qwen.sh). Unset DYNAMIC_K, or set PREFIX_CACHE=0." >&2
     exit 1
   else
     SPEC_CFG="${SPEC_CFG%\}},\"num_speculative_tokens_per_batch_size\":$DYNAMIC_K}"
@@ -569,16 +571,15 @@ fi
 SPEC_ARGS=()
 [ -n "$SPEC_CFG" ] && SPEC_ARGS=(--speculative-config "$SPEC_CFG")
 
-# PREFIX_CACHE=1: reuse the KV of a shared prompt prefix across requests, and resume the
-# recurrent (GDN) state from the last cached block boundary instead of re-running the prompt.
-# Turn-2+ of a chat with a 24k document goes from ~23 s to ~1 s (measured on vLLM 0.27.1,
-# against caching off). From vLLM 0.28 on, vLLM turns prefix caching on for this model by
-# default and switches the Mamba cache to align mode. So PREFIX_CACHE=0 does not turn it off
-# and pays the same state pages (on 0.31, SPEC=dflash2 CTX=fast: a 380-page KV pool either
-# way). =1 passes the two flags explicitly and adds the tuning below.
-# EXTRA_ARGS=--no-enable-prefix-caching is what turns caching off.
-if [ "${PREFIX_CACHE:-0}" = "1" ]; then
-  EXTRA_ARGS="--enable-prefix-caching --mamba-cache-mode align ${EXTRA_ARGS}"
+# Prefix caching (PREFIX_CACHE, on by default; qwen_prefix_cache passes the flags): reuse the
+# KV of a shared prompt prefix across requests, and resume the recurrent (GDN) state from the
+# last cached block boundary instead of re-running the prompt. Turn-2+ of a chat with a 24k
+# document goes from ~23 s to ~1 s (measured on vLLM 0.27.1, against caching off). The Mamba
+# state pages align mode needs are paid whenever the engine caches (on 0.31, SPEC=dflash2
+# CTX=fast: a 380-page KV pool with the flags and with vLLM's own default, which also caches).
+# What follows is the tuning and the safeguards that apply whenever the engine caches, keyed
+# on PREFIX_CACHE_ON so that caching turned on through EXTRA_ARGS gets them too.
+if [ "$PREFIX_CACHE_ON" = 1 ]; then
   # KVarN runs --block-size 128; match the prefix hash unit to its tile so cache
   # hits land on tile boundaries (a non-multiple of 128 corrupts the pool).
   [ "$CTX" = "huge" ] && EXTRA_ARGS="--prefix-match-unit 128 ${EXTRA_ARGS}"
@@ -670,11 +671,12 @@ if [ "${PREFIX_CACHE:-0}" = "1" ]; then
   # break identically, so the drafter is not implicated and every KVarN
   # speculator reaches it. It also needs a prefix-cache HIT to
   # fire at all, which is why PREFIX_CACHE=0 always looked clean (PR #13).
-  # That was vLLM 0.27.1. Since 0.28 PREFIX_CACHE=0 keeps vLLM's default caching. On 0.31,
-  # bench/residue_sweep.py over all 128 residues at CTX=huge SPEC=mtp with PREFIX_CACHE
-  # unset, under vLLM's default FULL_AND_PIECEWISE capture and an 86% prefix-cache hit
-  # rate, found 0 broken (2026-10-17). That run does not cover the PREFIX_CACHE=1 path,
-  # which keeps PIECEWISE below.
+  # That was vLLM 0.27.1. On 0.31, bench/residue_sweep.py over all 128 residues at CTX=huge
+  # SPEC=mtp with caching on through vLLM's default (no flags from this launcher, so neither
+  # PIECEWISE nor the prefix match unit), under vLLM's FULL_AND_PIECEWISE capture and an 86%
+  # prefix-cache hit rate, found 0 broken (2026-10-17). That run does not cover what this
+  # block sets up. The same sweep through this block (PIECEWISE, the match unit, the
+  # retention interval) also found 0 broken that day, and PIECEWISE stays below.
   # Correctness first, and it is close to free for MTP as well -- same depth
   # ladder, only the capture toggled, 8k/16k/32k/50k:
   #   FULL      87.8 / 86.1 / 70.4 / 63.5 tok/s
