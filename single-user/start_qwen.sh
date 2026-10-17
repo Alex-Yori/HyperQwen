@@ -44,7 +44,7 @@
 #   half the decode rate past 100k — see below and docs/long-context.md.
 # PTH_FA=1 (SPEC=mtp CTX=long and SPEC=dflash2 CTX=long only, default 0): int8 per-token-head KV read
 #   by the pth-flash-attn kernel (pthfa/), on the target and the MTP drafter instead of fp8 on FlashInfer,
-#   or on the DFlash2 target instead of TRITON_ATTN (its drafter stays there) — see below.
+#   or on the DFlash2 target and drafter instead of TRITON_ATTN — see below.
 #
 # Fast variant: MODEL defaults to models/Qwen3.8-27B-W4A16-AutoRound-fast when it
 # exists (int4-GPTQ lm_head + MTP, own-output draft vocab; drafter/README.md), else
@@ -274,18 +274,17 @@ fi
 # cache: 128k TTFT 129 s against 250 s, N=1 decode at 128k 85-92 against 46 tok/s, MTP tokens per step
 # and GSM8K unchanged (docs/long-context.md has the table, the hardware and the launch line; gotcha 63 the
 # limits). Default 0: unset, the argv and the environment are those of the arm without it.
-# SPEC=dflash2 CTX=long: the arm's own int8_per_token_head cache, read by the kernel on the target only.
-# The DFlash2 drafter's five layers are sliding-window and non-causal, which the kernel does not serve
-# (gotcha 63), so its speculative config gets no attention_backend and stays the arm's own, byte for
-# byte: the drafter autoselects TRITON_ATTN, as it does without the knob. VLLM_SPEC_DECODE_ATTN stays as
-# the arm sets it; on this arm only the drafter's Triton impl reads it, and its split-KV verify gate
-# skips the drafter's windowed layers (patches/spec-decode-int8-kv.patch). Only the measured drafting
-# setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or dflash), DFLASH_TOKENS unset or 7,
-# LOOKUP unset or 1 and DYNAMIC_K unset; anything else on this arm is refused. Capped 2x RTX 3080 20 GB
-# at TP=2, vLLM 0.31.0, one sitting (2026-10-17/18), N=1 decode at 128k: 108.4 tok/s with PTH_FA=1 (this
-# branch's image), 81.5 on the FA2 fp8 default, 58.6 on TRITON_ATTN int8; ms per pass 29.0 / 36.8 / 55.0;
-# GSM8K 0.955 on all three; FA2 has the shorter cold 128k prefill (114.1 against 122.3 s) and the larger
-# KV pool (517,656 against 504,770 tokens) (docs/long-context.md).
+# SPEC=dflash2 CTX=long: the arm's own int8_per_token_head cache, read by the kernel on the target AND the
+# DFlash2 drafter. The drafter's five layers are sliding-window (2048) and non-causal at head size 128,
+# which the kernel serves (its windowed kernels exist at head size 128 only; gotcha 63), so its speculative
+# config gets "attention_backend":"CUSTOM" as the mtp one does. It gets no kv_cache_dtype, so the drafter's
+# cache keeps the target's int8_per_token_head (vLLM overrides the drafter's dtype only when that key is
+# set). VLLM_SPEC_DECODE_ATTN stays as the arm sets it; it is read only by the FLASH_ATTN and TRITON_ATTN
+# impls (patches/spec-decode-attn.patch, spec-decode-int8-kv.patch), so with both models on CUSTOM nothing
+# reads it. Only the measured drafting setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or
+# dflash), DFLASH_TOKENS unset or 7, LOOKUP unset or 1 and DYNAMIC_K unset; anything else on this arm is
+# refused. Rows (target and drafter on the kernel, against TRITON_ATTN on the same cache):
+# docs/long-context.md.
 # On a compute capability 8.6 GPU this arm defaults to FA2_FP8KV=1 (fp8 KV on the FA2 plugin, above).
 # PTH_FA=1 overrides that default and refuses an explicit FA2_FP8KV=1; both happen in resolve_config.sh,
 # before the FA2 block above, so with PTH_FA=1 FA2_FP8KV is never 1 here.
@@ -341,12 +340,12 @@ sys.exit(0 if s and os.path.isfile(os.path.join(s.submodule_search_locations[0],
     exit 1
   }
   ATTN_ARGS="--attention-backend CUSTOM --kv-cache-dtype int8_per_token_head"
+  PTH_SPEC_BACKEND=',"attention_backend":"CUSTOM"'
   if [ "$SPEC" = mtp ]; then
-    PTH_SPEC_BACKEND=',"attention_backend":"CUSTOM"'
     echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and MTP drafter" >&2
   else
-    echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target only; the DFlash2" >&2
-    echo "  drafter is left to vLLM's autoselect (TRITON_ATTN): its sliding-window, non-causal layers are outside the kernel" >&2
+    echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and DFlash2" >&2
+    echo "  drafter on CUSTOM: the drafter's sliding-window, non-causal layers run the kernel's windowed path (head size 128)" >&2
   fi
   [ "${FA2_FP8KV_SRC:-}" = "PTH_FA=1 overrides the 8.6 default" ] \
     && echo "[start_qwen] PTH_FA=1: FA2_FP8KV=0, PTH_FA=1 overrides the 8.6 default (fp8 KV on the FA2 plugin)" >&2
@@ -388,7 +387,7 @@ if [ "$SPEC" = "dflash2" ]; then
   # DRAFT_METHOD=dspark runs a DSpark drafter (RadixArk/Qwen3.8-27B-DSpark, seven drafts per
   # step like the shipped head) through the same profile; it needs
   # patches/dspark-draft-quant-config.patch and the architecture rename in the README.
-  SPEC_CFG="{\"method\":\"${DRAFT_METHOD:-dflash}\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"${FA2_SPEC_ATTN}}"
+  SPEC_CFG="{\"method\":\"${DRAFT_METHOD:-dflash}\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$DRAFT_TOKENS,\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"${PTH_SPEC_BACKEND}${FA2_SPEC_ATTN}}"
   # The split-KV verify attention (patches/spec-decode-attn.patch) sizes its partial
   # buffers once for the longest query block it will see -- a captured CUDA graph holds
   # their addresses, so they must not be grown later.
