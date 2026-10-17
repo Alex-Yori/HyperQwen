@@ -29,6 +29,8 @@ jobs:
         run: python bench/verbatim.py
       - name: Check the bench harness (resolve_api_key.sh's key, the URL, streams and /metrics) without a GPU
         run: python bench/test_harness.py
+      - name: Check conc_ladder --salt repeats its prompts and reports a prefix-cache hit without a GPU
+        run: python bench/test_conc_ladder_salt.py
       - name: Check a launcher with no API key binds 127.0.0.1
         run: bash bench/test_no_key_bind.sh
       - name: Check KV_OFFLOAD_GB becomes one --kv-offloading-size in every launcher
