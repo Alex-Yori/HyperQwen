@@ -120,7 +120,8 @@ TRITON_ATTN --max-model-len 262144` (batch/start_qwen.sh: `KV=int4pth`).
 The block drafter was pinned to `CTX=fast` — bf16 KV on FlashAttention, 64k at
 `DFLASH_TOKENS=7` and 56k at 15 — because bf16 KV is 64 KB per token and the pinned
 5.2 GiB pool is exactly that much. `CTX=long` moves it to an `int8_per_token_head` cache
-on the Triton backend and roughly doubles the context:
+on the Triton backend (`FA2_FP8KV=0`; the default is now fp8 KV on FlashAttention-2, below) and
+roughly doubles the context:
 
 | | bf16 (`CTX=fast`) | int8 (`CTX=long`) |
 |---|---|---|
@@ -165,23 +166,30 @@ Two patches make that work, and neither changes anything at bf16:
   tracked separately): do not stack the two until the memory-pressure question behind it is
   understood.
 
-### Experimental: fp8 KV on FlashAttention-2 (`FA2_FP8KV=1`)
+### fp8 KV on FlashAttention-2 (`FA2_FP8KV`, default on for the 3090)
 
-`FA2_FP8KV=1 SPEC=dflash2 CTX=long` swaps the int8 + Triton arm for fp8 KV on `FLASH_ATTN`, with
-the fp8 kernels from the `fa2/` plugin (`bash fa2/install.sh` builds and installs it once; the
-launcher refuses to start without it). It is off by default, and the build targets sm86 only.
+`SPEC=dflash2 CTX=long` runs on fp8 KV on `FLASH_ATTN` by default, with the fp8 kernels from the
+`fa2/` plugin (`bash fa2/install.sh` builds and installs it once, the Docker image has it, and the
+launcher refuses to start without it instead of falling back). `FA2_FP8KV=0` restores the int8 +
+Triton arm described above. The build targets sm86 only, so the default is on only when
+`nvidia-smi` reports compute capability 8.6 (an RTX 3090-class GPU); any other GPU, or no answer
+from `nvidia-smi`, resolves an unset knob to 0 with a note. The sm86 build also runs on sm89, and
+`FA2_FP8KV=1` opts in on a 4090 (unmeasured); on sm120 it fails at boot.
 The drafter also selects `FLASH_ATTN`, `SPEC_ATTN` does nothing on this arm (the plugin has its
-own split-KV verify), and `MAX_LEN` and `KV_MEM` keep the defaults above. The launcher refuses it
-with any other `SPEC` or `CTX`, and with `KV_OFFLOAD_GB` or a KV connector in `EXTRA_ARGS`: the
+own split-KV verify), and `MAX_LEN` and `KV_MEM` keep the defaults above. An unset `FA2_FP8KV`
+resolves to 0, with a note, when `KV_OFFLOAD_GB` or a KV connector in `EXTRA_ARGS` is set: the
 plugin's backend supports only the LBNHC KV layout, vLLM's CPU-tier connector asks for LBHNC or
-BLHNC, and the CPU tier on this backend is untested. The tracker's T4 and issue #153 hold the
-measurements and what is still open.
+BLHNC, and the CPU tier on this backend is untested, so the offload tier keeps int8 + Triton. An
+explicit `FA2_FP8KV=1` refuses that combination, and any other `SPEC` or `CTX`. The evidence is the
+T4 battery on the native 3090 ([#153](https://github.com/syv-ai/HyperQwen/issues/153)):
+on 2026-10-18 (bare metal, 250 W, vLLM 0.31.0) the fp8 + FA2 arm passed every bar against the shipped int8 + Triton arm: GSM8K 0.950 vs 0.955 (n=200), perplexity +0.04%, 0 of 128 residues broken, a 20-minute soak with no restart, decode 54.0 vs 48.2 tok/s at ~66k and 48.2 vs 37.9 tok/s at ~100k (+27%), cold TTFT 75.5 vs 132.3 s and 54.7 vs 130.5 s, and a 3.3% larger pool (140,902 vs 136,429 tokens).
 
 ### What it is actually good for
 
 Measured against the option that already covers this context, on 112,655-token prompts
 (`bench/labd_bench.py --ctx 100000 --corpus ~/bench/labd_corpus_long.txt`), both with
-`PREFIX_CACHE=1`:
+`PREFIX_CACHE=1`; the `SPEC=dflash2` column is the int8 + Triton arm (`FA2_FP8KV=0`), measured
+before the default changed:
 
 | task | `SPEC=dflash2 CTX=long` (k=15) | `SPEC=mtp CTX=long` |
 |---|---|---|
