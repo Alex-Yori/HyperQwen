@@ -39,7 +39,7 @@
 #   not as the fast path. Numbers in gotcha 40.
 # FA2_FP8KV (default 1 on SPEC=dflash2 CTX=long on a compute capability 8.6 GPU): fp8 KV with the
 #   FA2 plugin (fa2/, bash fa2/install.sh) instead of int8 + Triton. FA2_FP8KV=0 restores int8 +
-#   Triton, and KV_OFFLOAD_GB or another GPU turns the default off. See the arm below.
+#   Triton, and KV_OFFLOAD_GB, PTH_FA=1 or another GPU turns the default off. See the arm below.
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/), 200k context with MTP, at roughly
 #   half the decode rate past 100k — see below and docs/long-context.md.
 # PTH_FA=1 (SPEC=mtp CTX=long and SPEC=dflash2 CTX=long only, default 0): int8 per-token-head KV read
@@ -285,6 +285,9 @@ fi
 # at TP=2, vLLM 0.31.0, this branch's image against main's image on TRITON_ATTN with the same cache, same
 # sitting (2026-10-17): 128k cold TTFT 122.5 s against 249.3 s, N=1 decode at 128k 108.1 against 58.9
 # tok/s, accepted length 4.81 against 4.79 of 7 drafts, GSM8K 0.960 against 0.955 (docs/long-context.md).
+# On a compute capability 8.6 GPU this arm defaults to FA2_FP8KV=1 (fp8 KV on the FA2 plugin, above).
+# PTH_FA=1 overrides that default and refuses an explicit FA2_FP8KV=1; both happen in resolve_config.sh,
+# before the FA2 block above, so with PTH_FA=1 FA2_FP8KV is never 1 here.
 PTH_FA=${PTH_FA:-0}
 PTH_SPEC_BACKEND=
 if [ "$PTH_FA" = 1 ]; then
@@ -295,11 +298,6 @@ if [ "$PTH_FA" = 1 ]; then
       echo "  refusing rather than booting an arm it was not measured on. Unset PTH_FA, or set one of those." >&2
       exit 1 ;;
   esac
-  if [ "${FA2_FP8KV:-0}" = 1 ]; then
-    echo "PTH_FA=1 and FA2_FP8KV=1 both pick the dflash2 backend (the int8 kernel against the FA2 fp8 port);" >&2
-    echo "  refusing rather than mixing them. Set one of the two." >&2
-    exit 1
-  fi
   if [ "$SPEC" = dflash2 ]; then
     if [ "${DRAFT_METHOD:-dflash}" != dflash ]; then
       echo "PTH_FA=1 on SPEC=dflash2 is measured with the DFlash2 drafter only; DRAFT_METHOD=$DRAFT_METHOD is a" >&2
@@ -349,6 +347,8 @@ sys.exit(0 if s and os.path.isfile(os.path.join(s.submodule_search_locations[0],
     echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target only; the DFlash2" >&2
     echo "  drafter is left to vLLM's autoselect (TRITON_ATTN): its sliding-window, non-causal layers are outside the kernel" >&2
   fi
+  [ "${FA2_FP8KV_SRC:-}" = "PTH_FA=1 overrides the 8.6 default" ] \
+    && echo "[start_qwen] PTH_FA=1: FA2_FP8KV=0, PTH_FA=1 overrides the 8.6 default (fp8 KV on the FA2 plugin)" >&2
 elif [ "$PTH_FA" != 0 ]; then
   echo "PTH_FA=$PTH_FA: set it to 0 or 1" >&2
   exit 1

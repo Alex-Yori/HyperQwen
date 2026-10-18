@@ -6,11 +6,13 @@
 # changes anything else in the argv or the VLLM_* environment; every other arm, a conflicting EXTRA_ARGS, a KV
 # connector, a missing install, a value other than 0/1, FA2_FP8KV=1 alongside it and, on dflash2, a drafting setup
 # other than the measured one (DRAFT_METHOD, DFLASH_TOKENS, LOOKUP, DYNAMIC_K) are refused, each with its own
-# message; batch mode warns and ignores it. Copies
+# message; batch mode warns and ignores it. On a compute capability 8.6 host (a stub nvidia-smi), where
+# SPEC=dflash2 CTX=long defaults to FA2_FP8KV=1: with no knob that default runs, PTH_FA=1 overrides it (the argv
+# and VLLM_* environment of PTH_FA=1 FA2_FP8KV=0), an explicit FA2_FP8KV=1 with PTH_FA=1 is refused before either
+# plugin is probed, and on 8.9 nothing changes. Copies
 # the checkout, without its own venv, to a temp dir and runs the launchers against a stub vllm (prints its argv,
-# then "@@ENV" and its VLLM_* environment) and a stub venv python (answers the install probe from
-# PTHFA_STUB_INSTALLED, accepts the FA2 fp8 plugin's probe, and passes anything else to python3). No GPU, no model,
-# no network.
+# then "@@ENV" and its VLLM_* environment) and a stub venv python (answers the install probes from
+# PTHFA_STUB_INSTALLED and FA2_STUB_INSTALLED, and passes anything else to python3). No GPU, no model, no network.
 #
 #   bash bench/test_pthfa_knob.sh
 #   PTHFA_BASE_TREE=<checkout without pthfa> bash bench/test_pthfa_knob.sh
@@ -32,14 +34,14 @@ stage() {
   mkdir -p "$2/venv/bin" "$2/models/Qwen3.8-27B-DFlash2-W4A16"
   : > "$2/models/Qwen3.8-27B-DFlash2-W4A16/model.safetensors"
   printf '#!/bin/sh\nprintf "%%s\\n" "$@"\necho @@ENV\nenv | grep "^VLLM_" | sort\n' > "$2/venv/bin/vllm"
-  printf '#!/bin/sh\ncase "$*" in *pth_flash_attn*) [ "${PTHFA_STUB_INSTALLED:-1}" = 1 ]; exit $? ;; *fa2_fp8kv*) exit 0 ;; esac\nexec python3 "$@"\n' > "$2/venv/bin/python"
+  printf '#!/bin/sh\ncase "$*" in *pth_flash_attn*) [ "${PTHFA_STUB_INSTALLED:-1}" = 1 ]; exit $? ;; *fa2_fp8kv*) [ "${FA2_STUB_INSTALLED:-1}" = 1 ]; exit $? ;; esac\nexec python3 "$@"\n' > "$2/venv/bin/python"
   chmod +x "$2/venv/bin/vllm" "$2/venv/bin/python"
 }
 stage "$REPO" "$T/new"
 # run <tree> <launcher> <env...>: argv and VLLM_* environment on stdout (stub vllm), stderr in $T/err, exit code
 # in $T/rc.
-# FA2_FP8KV=0: on a compute capability 8.6 host an unset knob resolves to 1 on SPEC=dflash2 CTX=long, and
-# the stub venv has no fa2 plugin, so that arm would refuse for a reason that has nothing to do with PTH_FA.
+# FA2_FP8KV=0: an unset knob resolves from the host's GPU (1 on SPEC=dflash2 CTX=long on compute capability 8.6),
+# so every run pins it but those that pass FA2_FP8KV= with a stub nvidia-smi (the 8.6 block below).
 run() { local tree=$1 sc=$2; shift 2
   (cd "$tree" && env -u PRINT_ARGV -u PTH_FA -u KV_OFFLOAD_GB -u EXTRA_ARGS -u SPEC -u CTX -u PYTORCH_CUDA_ALLOC_CONF \
      -u WSL_DISTRO_NAME -u CUDA_HOME -u FA2_FP8KV -u DRAFT_METHOD -u DFLASH_TOKENS -u LOOKUP -u VISION -u DYNAMIC_K \
@@ -115,11 +117,7 @@ echo "== refused (exit 1, with the refusal's own message on stderr)"
 # refusal's own text, never just "PTH_FA": the effective-config block prints PTH_FA=1 before any refusal.
 refused() { local why=$1 msg=$2; shift 2; run "$T/new" single-user/start_qwen.sh "$@" >/dev/null
   if [ "$(rc)" = 1 ] && grep -qF -- "$msg" "$T/err"; then check 1 1 "$why"; else check "1 ($msg)" "$(rc)" "$why"; fi; }
-# refused_either <why> <fragment> <other fragment> <env...>: as refused, with either fragment on stderr. For
-# FA2_FP8KV=1 on mtp: with #317 merged, its resolve_config.sh refuses that SPEC first, with its own message.
-refused_either() { local why=$1 msg=$2 alt=$3; shift 3; run "$T/new" single-user/start_qwen.sh "$@" >/dev/null
-  if [ "$(rc)" = 1 ] && { grep -qF -- "$msg" "$T/err" || grep -qF -- "$alt" "$T/err"; }; then check 1 1 "$why"
-  else check "1 ($msg | $alt)" "$(rc)" "$why"; fi; }
+FA2_MTP="FA2_FP8KV=1 runs only on SPEC=dflash2 CTX=long"
 GATE="is a SPEC=mtp CTX=long or SPEC=dflash2 CTX=long setting"
 XARGS="sets --attention-backend, --kv-cache-dtype and the speculative config itself"
 KVC="PTH_FA=1 with a KV connector"
@@ -136,8 +134,7 @@ refused "EXTRA_ARGS --speculative-config"     "$XARGS" SPEC=mtp CTX=long PTH_FA=
 refused "KV_OFFLOAD_GB=8"                     "$KVC"   SPEC=mtp CTX=long PTH_FA=1 KV_OFFLOAD_GB=8
 refused "EXTRA_ARGS --kv-offloading-size"     "$KVC"   SPEC=mtp CTX=long PTH_FA=1 EXTRA_ARGS="--kv-offloading-size 4"
 refused "no pth_flash_attn in the venv"       "$INST"  SPEC=mtp CTX=long PTH_FA=1 PTHFA_STUB_INSTALLED=0
-refused_either "FA2_FP8KV=1 alongside it"     "$FA2" "FA2_FP8KV=1 runs only on SPEC=dflash2 CTX=long" \
-  SPEC=mtp CTX=long PTH_FA=1 FA2_FP8KV=1
+refused "FA2_FP8KV=1 alongside it"            "$FA2_MTP" SPEC=mtp CTX=long PTH_FA=1 FA2_FP8KV=1
 refused "dflash2: EXTRA_ARGS --attention-backend"  "$XARGS" SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--attention-backend TRITON_ATTN"
 refused "dflash2: EXTRA_ARGS --kv-cache-dtype"     "$XARGS" SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--kv-cache-dtype=int8_per_token_head"
 refused "dflash2: EXTRA_ARGS --speculative-config" "$XARGS" SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--speculative-config {}"
@@ -159,6 +156,51 @@ run "$T/new" single-user/start_qwen.sh SPEC=mtp CTX=long PTH_FA=1 KV_OFFLOAD_GB=
 check 0 "$(rc)" "KV_OFFLOAD_GB=0 is no tier: boots"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 KV_OFFLOAD_GB=0 >/dev/null
 check 0 "$(rc)" "dflash2: KV_OFFLOAD_GB=0 is no tier: boots"
+
+echo "== compute capability 8.6 host (stub nvidia-smi), FA2_FP8KV unset: the FA2 default, and PTH_FA=1 over it"
+# smi <cap>: PATH=<dir>:$PATH, where <dir>/nvidia-smi answers <cap> to resolve_config.sh's compute_cap query.
+smi() { mkdir -p "$T/smi-$1"; printf '#!/bin/sh\necho %s\n' "$1" > "$T/smi-$1/nvidia-smi"; chmod +x "$T/smi-$1/nvidia-smi"
+  echo "PATH=$T/smi-$1:$PATH"; }
+S86=$(smi 8.6); S89=$(smi 8.9)
+OVR="PTH_FA=1 overrides the 8.6 default"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$S86" > "$T/f0"; cp "$T/err" "$T/f0.err"
+check "0 FLASH_ATTN fp8" "$(rc) $(after --attention-backend < "$T/f0") $(after --kv-cache-dtype < "$T/f0")" \
+  "no knob: the FA2 default runs (fp8 KV on FLASH_ATTN)"
+grep -qF '[effective-config] CTX=long SPEC=dflash2 FA2_FP8KV=1 (default)' "$T/f0.err" \
+  && check 1 1 "no knob: the effective config says FA2_FP8KV=1 (default)" || check 1 0 "no knob: the effective config says FA2_FP8KV=1 (default)"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= PTH_FA=0 "$S86" > "$T/f00"; cp "$T/err" "$T/f00.err"
+check "same same" "$(cmp -s "$T/f0" "$T/f00" && echo same || echo differs) $(cmp -s "$T/f0.err" "$T/f00.err" && echo same || echo differs)" \
+  "PTH_FA=0: the same argv, VLLM_* environment and stderr as no knob"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= PTH_FA=1 "$S86" > "$T/f1"; cp "$T/err" "$T/f1.err"
+check "0 same" "$(rc) $(cmp -s "$T/f1" "$T/don" && echo same || echo differs)" \
+  "PTH_FA=1 boots with the argv and VLLM_* environment of PTH_FA=1 FA2_FP8KV=0"
+grep -qF "[effective-config] CTX=long SPEC=dflash2 FA2_FP8KV=0 ($OVR)" "$T/f1.err" \
+  && check 1 1 "PTH_FA=1: the effective config says it overrides the default" || check 1 0 "PTH_FA=1: the effective config says it overrides the default"
+grep -qF "[start_qwen] PTH_FA=1: FA2_FP8KV=0, $OVR" "$T/f1.err" \
+  && check 1 1 "PTH_FA=1: the launcher says so" || check 1 0 "PTH_FA=1: the launcher says so"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV=0 PTH_FA=1 "$S86" > "$T/f10"; cp "$T/err" "$T/f10.err"
+check "0 same 0" "$(rc) $(cmp -s "$T/f10" "$T/don" && echo same || echo differs) $(grep -c "$OVR" "$T/f10.err")" \
+  "PTH_FA=1 FA2_FP8KV=0 (explicit): boots, the same argv, no override line"
+refused "8.6: FA2_FP8KV=1 alongside it"                 "$FA2" SPEC=dflash2 CTX=long PTH_FA=1 FA2_FP8KV=1 "$S86"
+refused "8.6: FA2_FP8KV=1 alongside it, no fa2 plugin" "$FA2" SPEC=dflash2 CTX=long PTH_FA=1 FA2_FP8KV=1 FA2_STUB_INSTALLED=0 "$S86"
+run "$T/new" single-user/start_qwen.sh SPEC=mtp CTX=long FA2_FP8KV= PTH_FA=1 "$S86" > "$T/fm"
+check "0 same" "$(rc) $(cmp -s "$T/fm" "$T/on" && echo same || echo differs)" "mtp PTH_FA=1: the same argv and VLLM_* environment"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= PTH_FA=1 "$S89" > "$T/f9"; cp "$T/err" "$T/f9.err"
+check "0 same 0 1" "$(rc) $(cmp -s "$T/f9" "$T/don" && echo same || echo differs) $(grep -c "$OVR" "$T/f9.err") $(grep -cF \
+  '[effective-config] CTX=long SPEC=dflash2 FA2_FP8KV=0 (default, off: compute capability 8.9)' "$T/f9.err")" \
+  "8.9: PTH_FA=1 boots, the same argv, the default is the FA2 block's own off (no override line)"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$S89" > "$T/f90"
+check "0 TRITON_ATTN" "$(rc) $(after --attention-backend < "$T/f90")" "8.9, no knob: int8 on TRITON_ATTN (control)"
+if [ -n "${PTHFA_BASE_TREE:-}" ]; then
+  stage "$PTHFA_BASE_TREE" "$T/base86"
+  for c in 8.6 8.9; do cap=$(smi "$c")
+    run "$T/base86" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$cap" > "$T/x"; sed "s|$T/base86|TREE|g" "$T/err" > "$T/x.err"
+    run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$cap" > "$T/y"; sed "s|$T/new|TREE|g" "$T/err" > "$T/y.err"
+    sed -i "s|$T/base86|TREE|g" "$T/x"; sed -i "s|$T/new|TREE|g" "$T/y"
+    check "same same" "$(cmp -s "$T/x" "$T/y" && echo same || echo differs) $(cmp -s "$T/x.err" "$T/y.err" && echo same || echo differs)" \
+      "no knob, nvidia-smi $c: argv, VLLM_* environment and stderr against $PTHFA_BASE_TREE"
+  done
+fi
 
 echo "== batch mode ignores it, and says so"
 run "$T/new" batch/start_qwen.sh > "$T/b0"

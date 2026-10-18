@@ -1512,7 +1512,10 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets (on
     mtp the speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and
     dropping it puts the MTP layer on another backend, while on dflash2 a `CUSTOM` there would stop
-    the boot at the drafter's layers); `FA2_FP8KV=1`, the other knob that picks the dflash2 backend;
+    the boot at the drafter's layers); an explicit `FA2_FP8KV=1`, the other knob that picks the dflash2
+    backend (an unset one, which defaults to 1 on that arm on a compute capability 8.6 GPU, is overridden:
+    `PTH_FA=1` keeps it at 0, and the effective-config line reads `FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6
+    default)`);
     and on dflash2 any drafting setup but the measured one: `DRAFT_METHOD` other than `dflash` (a
     different drafter), `DFLASH_TOKENS` other than 7 (a different verify block on the target, adaptive
     in length above 7), `LOOKUP=0` and `DYNAMIC_K` (a draft count per batch size, which varies the verify

@@ -180,7 +180,9 @@ own split-KV verify), and `MAX_LEN` and `KV_MEM` keep the defaults above. An uns
 resolves to 0, with a note, when `KV_OFFLOAD_GB` or a KV connector in `EXTRA_ARGS` is set: the
 plugin's backend supports only the LBNHC KV layout, vLLM's CPU-tier connector asks for LBHNC or
 BLHNC, and the CPU tier on this backend is untested, so the offload tier keeps int8 + Triton. An
-explicit `FA2_FP8KV=1` refuses that combination, and any other `SPEC` or `CTX`. The evidence is the
+explicit `FA2_FP8KV=1` refuses that combination, and any other `SPEC` or `CTX`. `PTH_FA=1` (the
+pth-flash-attn kernel, below) is the other backend for this arm: with it an unset `FA2_FP8KV` stays
+0 on an 8.6 GPU too, and an explicit `FA2_FP8KV=1` alongside it is refused. The evidence is the
 T4 battery on the native 3090 ([#153](https://github.com/syv-ai/HyperQwen/issues/153)):
 on 2026-10-18 (bare metal, 250 W, vLLM 0.31.0) the fp8 + FA2 arm passed every bar against the shipped int8 + Triton arm: GSM8K 0.950 vs 0.955 (n=200), perplexity +0.04%, 0 of 128 residues broken, a 20-minute soak with no restart, decode 54.0 vs 48.2 tok/s at ~66k and 48.2 vs 37.9 tok/s at ~100k (+27%), cold TTFT 75.5 vs 132.3 s and 54.7 vs 130.5 s, and a 3.3% larger pool (140,902 vs 136,429 tokens).
 
@@ -312,8 +314,9 @@ The GPU checks are `bench/test_pthfa_attn.py` (kernel against an fp64 reference,
 
 ### `SPEC=dflash2 CTX=long PTH_FA=1`: the target on the kernel, the drafter on `TRITON_ATTN`
 
-`SPEC=dflash2 CTX=long` already runs `int8_per_token_head`, on `TRITON_ATTN` (see "DFlash2 past 64k"
-above), and its decode decays with context. `PTH_FA=1` keeps that cache and moves the target's 16
+`SPEC=dflash2 CTX=long` with `FA2_FP8KV=0` runs `int8_per_token_head` on `TRITON_ATTN` (see "DFlash2 past
+64k" above; on an 8.6 GPU the default is fp8 KV on FlashAttention-2), and its decode decays with context.
+`PTH_FA=1` keeps the int8 cache and moves the target's 16
 full-attention layers onto the kernel:
 
 ```bash
@@ -342,6 +345,12 @@ one, i.e. `DRAFT_METHOD` other than `dflash` (DSpark is another drafter), `DFLAS
 (it changes the target's verify block, and above 7 makes its length adaptive), `LOOKUP=0`, and `DYNAMIC_K`
 (a draft count per batch size, so the verify block's length varies with the batch). `VISION=1` is accepted
 and untested on this arm (gotcha 63).
+
+**On an 8.6 GPU `PTH_FA=1` overrides the FA2 default.** There an unset `FA2_FP8KV` resolves to 1 on this
+arm (fp8 KV on FlashAttention-2, above); with `PTH_FA=1` it stays 0, so the argv and the environment are
+the ones above on every card the kernel serves, and the effective-config line reads
+`FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6 default)`. An explicit `FA2_FP8KV=1` with `PTH_FA=1` is refused
+before either plugin is probed (`resolve_config.sh`); `FA2_FP8KV=0` is accepted.
 
 **Measured on two RTX 3080 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090:** the
 same box as above (Linux in a Proxmox LXC container, driver 615.71.09, PCIe without P2P). Capped
@@ -384,8 +393,8 @@ graphs: every one of the 128 prompt-length residues, sent twice so the second is
 hit, comes back verbatim with `PTH_FA=1` on both images, 0 broken of 128 (`bench/residue_sweep.py`; the
 corpus was a stand-in, this repo's `README.md` and `docs/*.md`, because the sweep's usual corpus file was
 not on this box; the test depends on the prompt length mod 128, not on the text). For reference, the
-FA2 fp8 port of #315-#317 (`FA2_FP8KV=1` on that stack's own image, not part of this tree) was measured
-on the same box and state in an earlier sitting (2026-10-14), not repeated here: 81.4 tok/s one-stream
+FA2 fp8 arm (`FA2_FP8KV=1`, #315-#319, now this arm's default on an 8.6 GPU), on that stack's own image
+before it merged, was measured on the same box and state in an earlier sitting (2026-10-14), not repeated here: 81.4 tok/s one-stream
 decode at 128k, against 58.3 on `TRITON_ATTN` and 106.7 with this arm's argv in that sitting.
 **Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm.
 
