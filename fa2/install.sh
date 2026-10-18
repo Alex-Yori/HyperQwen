@@ -21,6 +21,9 @@ export MAX_JOBS=${MAX_JOBS:-2}
 
 "$PY" -c 'import torch, flashinfer' >/dev/null 2>&1 || fail "cannot import torch and flashinfer with $PY (README: Setup)"
 "$PY" -c 'import setuptools' >/dev/null 2>&1 || fail "setuptools is missing from $PY (pip install setuptools)"
+# a uv venv has no pip unless it was made with --seed
+"$PY" -m pip --version >/dev/null 2>&1 || { echo "== $PY has no pip: installing it with ensurepip"
+  "$PY" -m ensurepip >/dev/null || fail "$PY has no pip and ensurepip failed (uv pip install --python $PY pip)"; }
 command -v g++ >/dev/null || fail "no host C++ compiler (apt install build-essential)"
 
 # CUTLASS: include/ only, fetched at the pinned commit and verified. A cache at another commit is refetched.
