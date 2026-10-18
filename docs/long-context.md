@@ -363,15 +363,16 @@ and `syvai/qwen3.8-27b-3090-fast-variant` (int4-GPTQ lm_head and MTP module, dra
 drafter `models/Qwen3.8-27B-DFlash2-W4A16`, fetched by `prepare/fetch_dflash2.py` from
 `syvai/Qwen3.8-27B-DFlash2-W4A16`.
 
-Two sittings on 2026-10-17, each with `main`'s image on `TRITON_ATTN` (the arm without the knob, built
-from 95ee3b6) as the same-sitting control, run first and repeated last for drift. First sitting: this
+Two sittings on 2026-10-17, in the morning (04:56-08:45 box time) and during the day (10:30-16:35), each with
+`main`'s image on `TRITON_ATTN` (the arm without the knob, built
+from 95ee3b6) as the same-sitting control, run first and repeated last for drift. Morning sitting: this
 branch's image built at 8b55d4a with `PTH_FA=1`. 8b55d4a is this branch before its last commit
 (a61f0a6), which adds refusals, tests and docs only: the argv of this arm and the `pthfa/` files are the
-same. Second sitting: the image built at a61f0a6, the same launch, to confirm the final commit. Distinct
-8k / 32k / 128k prompts (the same prompts in both sittings), 256 tokens out, greedy; medians of 3 reps
+same. Daytime sitting: the image built at a61f0a6, the same launch, to confirm the final commit. Distinct
+8k / 32k / 128k prompts (the same prompts in both), 256 tokens out, greedy; medians of 3 reps
 (8k: 5) unless the row says n; ratio `CUSTOM` / `TRITON_ATTN` of the same sitting, 95% CI in brackets:
 
-| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | 1st sitting: `TRITON_ATTN` (int8) | 1st: `CUSTOM` target (`PTH_FA=1`, image at 8b55d4a) | 1st: ratio | 2nd sitting: `TRITON_ATTN` (int8) | 2nd: `CUSTOM` target (`PTH_FA=1`, image at a61f0a6) | 2nd: ratio |
+| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | 2026-10-17 morning: `TRITON_ATTN` (int8) | morning: `CUSTOM` target (`PTH_FA=1`, image at 8b55d4a) | morning: ratio | 2026-10-17 daytime: `TRITON_ATTN` (int8) | daytime: `CUSTOM` target (`PTH_FA=1`, image at a61f0a6) | daytime: ratio |
 |---|---|---|---|---|---|---|
 | TTFT 128k cold (n=1) / 32k warm (n=5) / 8k warm (n=7) | 249.3 / 30.99 / 5.93 s | 122.5 / 23.24 / 5.44 s | 0.491 / 0.750 [0.60-0.89] / 0.918 [0.913-0.921] | 249.6 / 31.01 / 5.93 s | 122.4 / 23.21 / 5.47 s | 0.491 / 0.748 [0.60-0.89] / 0.922 [0.920-0.925] |
 | 1 stream decode at 128k / 32k / 8k | 58.9 / 101.9 / 138.5 tok/s | 108.1 / 126.3 / 148.1 tok/s | 1.84 [1.77-1.96] / 1.24 [1.05-1.28] / 1.07 [0.95-1.10] | 59.1 / 102.2 / 138.1 tok/s | 107.3 / 127.2 / 147.3 tok/s | 1.81 [1.76-1.95] / 1.24 [1.05-1.28] / 1.07 [0.95-1.11] |
@@ -384,18 +385,68 @@ same. Second sitting: the image built at a61f0a6, the same launch, to confirm th
 
 No preemption in any arm; needles at 50% and 90% depth of a 128k prompt retrieved and determinism at
 1k/8k/32k passing in every arm with the full gate set. The control repeated last moved by at most 1.4%
-on any median in the first sitting (decode and TTFT 0.992-1.003, ms per pass 1.001-1.014) and by about
-1% in the second (ms per pass 0.988-1.002, decode 0.990-1.006, all CIs including 1). The two `CUSTOM`
+on any median in the 2026-10-17 morning sitting (decode and TTFT 0.992-1.003, ms per pass 1.001-1.014)
+and by about 1% in the daytime one (ms per pass 0.988-1.002, decode 0.990-1.006, all CIs including 1). The two `CUSTOM`
 images agree within that drift (ms per pass 29.2 / 24.6 / 23.6 against 29.1 / 24.5 / 23.7). As on the
 mtp arm, the gain grows with context: at 8k the one-stream decode intervals include 1. Acceptance does
 not depend on the backend: per-position rates agree within 0.01. Prefix caching with the arm's FULL
 graphs: every one of the 128 prompt-length residues, sent twice so the second is a full prefix-cache
 hit, comes back verbatim with `PTH_FA=1` on both images, 0 broken of 128 (`bench/residue_sweep.py`; the
 corpus was a stand-in, this repo's `README.md` and `docs/*.md`, because the sweep's usual corpus file was
-not on this box; the test depends on the prompt length mod 128, not on the text). For reference, the
-FA2 fp8 arm (`FA2_FP8KV=1`, #315-#319, now this arm's default on an 8.6 GPU), on that stack's own image
-before it merged, was measured on the same box and state in an earlier sitting (2026-10-14), not repeated here: 81.4 tok/s one-stream
-decode at 128k, against 58.3 on `TRITON_ATTN` and 106.7 with this arm's argv in that sitting.
+not on this box; the test depends on the prompt length mod 128, not on the text).
+
+**Against the FA2 fp8 default, same sitting.** On an 8.6 GPU this arm's default is fp8 KV on
+FlashAttention-2 (`FA2_FP8KV=1`, above), not `TRITON_ATTN` int8; `PTH_FA=1` replaces it with the int8 cache
+on this kernel. They were measured back to back in a third sitting, 2026-10-17 20:11 to 2026-10-18 03:08, same box, capped
+state, launch shape and prompts as above: `main`'s image before the FA2 merge (built from 95ee3b6) on
+`TRITON_ATTN` int8, the FA2 change's own image (built from its head 71253a4) with no knob set, which
+resolves to the FA2 default on this box, and this branch's image built at a61f0a6 with `PTH_FA=1`. Each had
+the full gate set; medians of 3 reps (8k: 5), cold TTFT n=1, 95% CI in brackets:
+
+| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long`, 2026-10-17 | `TRITON_ATTN` int8 (`FA2_FP8KV=0`) | `FLASH_ATTN` fp8 (the 8.6 default) | `CUSTOM` target (`PTH_FA=1`) | `CUSTOM` / FA2 | FA2 / `TRITON_ATTN` |
+|---|---|---|---|---|---|
+| 1 stream decode at 128k / 32k / 8k | 58.6 / 102.0 / 137.1 tok/s | 81.5 / 110.8 / 134.2 tok/s | 108.4 / 127.5 / 148.5 tok/s | 1.33 [1.18-1.41] / 1.15 [1.09-1.25] / 1.11 [0.99-1.14] | 1.39 [1.33-1.60] / 1.09 [0.89-1.12] / 0.98 [0.92-1.03] |
+| ms per forward pass, same | 55.0 / 31.0 / 25.1 | 36.8 / 28.8 / 25.0 | 29.0 / 24.6 / 23.4 | 0.789 [0.788-0.793] / 0.854 [0.844-0.857] / 0.936 [0.932-0.950] | 0.669 [0.664-0.678] / 0.931 [0.921-0.938] / 0.995 [0.989-1.004] |
+| 2 streams, per stream, same | 32.7 / 50.5 / 78.9 tok/s | 39.3 / 54.4 / 77.0 tok/s | 54.6 / 69.9 / 82.0 tok/s | 1.39 [1.32-1.41] / 1.29 [1.17-1.38] / 1.07 [1.01-1.15] | 1.20 [1.16-1.23] / 1.08 [0.90-1.13] / 0.98 [0.92-1.03] |
+| ms per forward pass, 2 streams | 63.3 / 35.9 / 29.3 | 54.1 / 38.6 / 30.7 | 39.0 / 30.3 / 28.0 | 0.720 [0.717-0.729] / 0.785 [0.777-0.788] / 0.912 [0.908-0.916] | 0.855 [0.842-0.863] / 1.073 [1.064-1.074] / 1.048 [0.988-1.058] |
+| TTFT cold, 128k / 32k / 8k | 249.6 / 27.8 / 6.22 s | 114.1 / 18.3 / 5.85 s | 122.3 / 18.7 / 5.45 s | 1.071 / 1.024 / 0.931 | 0.457 / 0.657 / 0.940 |
+| KV pool at `MAX_LEN=262144` | 477,599 tokens | 517,656 tokens | 504,770 tokens | 0.975 | 1.084 |
+| accepted length per draft (of 7), GSM8K window | 4.794 | 4.838 | 4.811 | 0.994 | 1.009 |
+| GSM8K n=200, greedy | 0.955 | 0.955 | 0.955 | 0 pt | 0 pt |
+| residue sweep, 128 prompt-length residues | 0 broken | 0 broken | 0 broken | | |
+
+Needles at 50% and 90% of 128k retrieved, determinism at 1k/8k/32k passing and no preemption in all three.
+Where FA2 is ahead: the cold 128k prefill is 6.7% shorter (the ladder's 128k TTFT ratio is 1.071
+[1.070-1.072]) and its pool is 2.6% larger. Per decode pass at one stream the kernel takes 21% less time than FA2 at
+128k and 6% less at 8k; at two streams FA2 takes longer per pass than `TRITON_ATTN` at 32k (1.073
+[1.064-1.074]) and at 8k (1.048, CI including 1). On the ladder's 128k
+prompt FA2 accepts 3.012 tokens per step against 3.108 here (the same in both FA2 boots), so the 128k
+tok/s ratio carries that prompt's acceptance; ms per pass does not. A second boot of the FA2 image
+reproduced its ms per pass within about 1%, and the control repeated last within 2%.
+
+**Accuracy against a bf16 cache, same images.** Teacher-forced prompt logprobs of a 32k and a 128k document
+(30,616 and 127,937 scored positions) against a reference with bf16 KV on `FLASH_ATTN` (the launcher's
+`CTX=fast` on `main`'s image, same checkpoints), all boots at `MAX_LEN=135168 GPU_UTIL=0.88`, 2026-10-18.
+Mean |delta logprob| of the actual token, 32k / 128k: `TRITON_ATTN` int8 0.0219 / 0.0194, `PTH_FA=1` int8
+0.0207 / 0.0193, FA2 fp8 0.0360 / 0.0338 (p99 0.156 / 0.152, 0.150 / 0.150, 0.268 / 0.274). A
+non-inferiority test (the new arm's mean |delta| at most the old arm's plus max(10% of it, 0.002 nats),
+on the point estimates over all scored positions and over the last 2048, with a 95% CI of the paired
+per-position difference from a non-overlapping block bootstrap, blocks of 256 and 1024 positions):
+`PTH_FA=1` passes against `TRITON_ATTN` int8, and FA2 fp8 fails against both int8 arms, by +0.014 to
++0.015 nats over all scored positions in both documents, CIs excluding 0. GSM8K n=200 cannot resolve a difference of this size.
+
+**The T4 battery** (`bench/t4_battery.py`, its own configuration: `MAX_SEQS=4 GPU_UTIL=0.93`, max model
+length 131072, 2048 batched tokens, ~60k and ~90k prompts, so not comparable with the tables above),
+2026-10-18, same box and state, three arms: `TRITON_ATTN` int8 and FA2 fp8 on the image of the FA2
+change, and the int8 kernel on an image that puts the DFlash2 drafter on the kernel as well (the
+target-only configuration of this section was not run through the battery). Every bar passes for all
+three: GSM8K 0.960 / 0.955 / 0.965, perplexity over the whole set 8.4013 / 8.4020 / 8.4022, 0 of 128 residues broken, soak exits 0 (FA2 60 min, the kernel 240 min; the battery soaks no int8
+Triton arm). Decode at ~60k 55.3 / 69.5 / 81.7 tok/s and at ~90k 44.2 / 62.2 / 76.1 tok/s, i.e. the
+kernel +17.6% and +22.3% over FA2; cold TTFT at ~60k 76.0 / 46.8 / 49.1 s (FA2 4.9% shorter than the
+kernel). One run per arm, no CIs. The corpus was a stand-in, this repo's markdown, because the battery's
+usual corpus was not on this box; the arms share it, absolute numbers are not comparable with other
+machines'.
+
 **Not measured, so not claimed:** any card but the RTX 3080, TP=1, and `VISION=1` on this arm.
 
 ## DFlash2 at 240k: `CTX=huge` (KVarN) also combines with `SPEC=dflash2`

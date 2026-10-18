@@ -282,9 +282,10 @@ fi
 # skips the drafter's windowed layers (patches/spec-decode-int8-kv.patch). Only the measured drafting
 # setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or dflash), DFLASH_TOKENS unset or 7,
 # LOOKUP unset or 1 and DYNAMIC_K unset; anything else on this arm is refused. Capped 2x RTX 3080 20 GB
-# at TP=2, vLLM 0.31.0, this branch's image against main's image on TRITON_ATTN with the same cache, same
-# sitting (2026-10-17): 128k cold TTFT 122.5 s against 249.3 s, N=1 decode at 128k 108.1 against 58.9
-# tok/s, accepted length 4.81 against 4.79 of 7 drafts, GSM8K 0.960 against 0.955 (docs/long-context.md).
+# at TP=2, vLLM 0.31.0, one sitting (2026-10-17/18), N=1 decode at 128k: 108.4 tok/s with PTH_FA=1 (this
+# branch's image), 81.5 on the FA2 fp8 default, 58.6 on TRITON_ATTN int8; ms per pass 29.0 / 36.8 / 55.0;
+# GSM8K 0.955 on all three; FA2 has the shorter cold 128k prefill (114.1 against 122.3 s) and the larger
+# KV pool (517,656 against 504,770 tokens) (docs/long-context.md).
 # On a compute capability 8.6 GPU this arm defaults to FA2_FP8KV=1 (fp8 KV on the FA2 plugin, above).
 # PTH_FA=1 overrides that default and refuses an explicit FA2_FP8KV=1; both happen in resolve_config.sh,
 # before the FA2 block above, so with PTH_FA=1 FA2_FP8KV is never 1 here.
