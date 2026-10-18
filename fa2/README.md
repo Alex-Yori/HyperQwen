@@ -6,7 +6,8 @@ and checked in CI against the flash-attention commit vLLM pins. Tracked in syv-a
 maintainer decided against adopting the prebuilt plugin binary and asked for a source port that CI checks
 against pinned upstream, like `patches/`.
 
-This directory holds the sources and the check. Building and installing them is not part of it yet.
+This directory holds the sources, the check, the build and the adapter. Nothing uses it unless `FA2_FP8KV=1`
+(the launcher knob, a later change): the installed plugin's `register()` is a no-op otherwise.
 
 ## Provenance
 
@@ -56,6 +57,54 @@ After a deliberate change to a header or `.cu` file, regenerate the patch with
 
 The `patch-integrity` workflow runs this, and first checks that the pinned vLLM tag still pins `FA_COMMIT`.
 When a vLLM bump moves that pin, re-run the check against the new commit and update `PIN`.
+
+## Build and install
+
+`bash fa2/install.sh` into the repo venv (`PY=...` for another interpreter). No GPU. It needs nvcc 13
+(a system one, `CUDA_HOME`, or the pip `nvidia-cuda-nvcc==13.0.88` already in the venv per
+`docker/requirements.txt`), a host C++ compiler and git. It:
+
+1. fetches CUTLASS `CUTLASS_COMMIT` (`include/` only) into `~/.cache/hyperqwen-fa2` and checks the commit;
+   `CUTLASS_PATH` points at an include dir you already have instead;
+2. runs `build.py --pipeline --prefill` unchanged, from a copy under that cache, for
+   `TORCH_CUDA_ARCH_LIST` (default 8.6) with `MAX_JOBS` (default 2). `fa2/` itself stays clean;
+3. installs the `fa2_fp8kv_vllm` package with `fa2_fp8kv.so` and `fa2_fp8kv_prefill.so` inside it, and the
+   `vllm.general_plugins` entry point, with `pip install --no-deps --no-build-isolation`.
+
+Measured in the Docker build on this repo's builder: about 3 minutes of nvcc, `fa2_fp8kv.so` 9.7 MB and
+`fa2_fp8kv_prefill.so` 0.2 MB.
+
+Re-running skips the compile while both libraries are newer than every source and were built for the same
+torch, nvcc, arch, CUTLASS and flashinfer (a stamp file). `FA2_FP8KV_LIBRARY` and `FA2_FP8KV_PREFILL_LIBRARY`
+override the library paths. The Docker image runs the same script before `COPY . .`.
+
+`FA2_FP8KV=1` is the gate. Unset (or any other value) `register()` does nothing, the libraries are not
+loaded and `FLASH_ATTN` is the stock backend. Set, `FLASH_ATTN` becomes `Fp8FlashAttentionBackend`: for an fp8
+cache on sm86/89/120 it narrows the KV layout to `LBNHC` and runs the fp8 op, for any other cache dtype it
+behaves as the stock backend. `python -c 'import fa2_fp8kv_vllm.paths as p; p.check()'` exits non-zero
+when a library is missing.
+
+## GPU checks
+
+`tests/` holds the plugin author's numerical checks, copied from `5c3a7d8`. `check_full.py`, `check_window.py`
+and `check_replay.py` take `--library`/a path argument that now defaults to the installed library; `check_full.py`
+also has three extra cases at the end of its default list for this model's shapes (`hq-*`). Run them on the
+GPU, from the repo root, with the venv python:
+
+```bash
+export FA2_FP8KV=1                              # check_backend and check_mixed_prefill load the libraries through the gate
+venv/bin/python fa2/tests/check_full.py          # add --full for the 262k-key and 2048-query cases
+venv/bin/python fa2/tests/check_window.py        # noncausal 2048 window, CUDA-graph replay, discarded pages
+venv/bin/python fa2/tests/check_replay.py        # ragged batches and changing metadata under graph replay
+venv/bin/python fa2/tests/check_backend.py       # KV write, attention and graph replay through the adapter
+venv/bin/python fa2/tests/check_mixed_prefill.py --device cuda
+```
+
+For this model the target is D256 with 24 q and 4 KV heads, and the drafter D128 with 8 KV heads and the
+noncausal 2048 window (TP=1). `check_window.py` (D128, 4 KV heads) and `check_replay.py` (D256) match them most
+directly, `check_full.py` covers both head dims, and the `hq-*` cases use the 4 and 8 KV head counts (the
+drafter's q-head count there is a guess). `check_mixed_prefill.py --device cpu` needs no GPU and runs in the
+image build, with `tests/gate_test.py` (the gate and the layout narrowing).
 
 ## Licences
 
