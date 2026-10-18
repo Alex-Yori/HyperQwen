@@ -333,8 +333,8 @@ What that resolves to, the settings that matter (the full argv: `PRINT_ARGV=1`):
 As on mtp, the `"attention_backend":"CUSTOM"` inside the speculative config is what puts the drafter on
 the kernel: a drafter takes its backend only from there. The speculative config is the arm's own with
 that one key appended; nothing else in the argv or the environment changes (`bench/test_pthfa_knob.sh`
-checks it, also against the parent branch's launcher, where the same line has no `attention_backend`
-and the drafter autoselects `TRITON_ATTN`). It names no `kv_cache_dtype`, so the drafter's cache keeps
+checks it, also against a launcher with the target-only configuration, where the same line has no
+`attention_backend` and the drafter autoselects `TRITON_ATTN`). It names no `kv_cache_dtype`, so the drafter's cache keeps
 the target's `int8_per_token_head` (vLLM 0.31.0 overrides the drafter's dtype only when that key is set).
 
 **What the kernel serves for the drafter, and nothing more.** The drafter's layers are sliding-window
@@ -347,7 +347,8 @@ multimodal prefix and R-SWA stay refused (gotcha 63, `pthfa/tests/gate_test.py`)
 request's window, which vLLM points at its null block, are never read: the kernel starts each row tile's
 key range at the window's lower edge and zero-fills below it. The causal kernels the target runs compile
 to the same SASS as the previous pin's (pth-flash-attn's `tools/sass_diff.py`: 105 kernels identical,
-18 new, on sm80/86/89), so the target's half of this arm is the parent branch's kernel.
+18 new, on sm80/86/89), so the target's half of this arm runs the same machine code as the target-only
+configuration.
 `VLLM_SPEC_DECODE_ATTN` stays the arm's 1; with both models on `CUSTOM` nothing reads it (only the
 `FLASH_ATTN` and `TRITON_ATTN` impls do). Refused at startup, besides the mtp arm's refusals: a drafting
 setup other than the measured one, i.e. `DRAFT_METHOD` other than `dflash` (DSpark is another drafter),
@@ -361,7 +362,7 @@ the ones above on every card the kernel serves, and the effective-config line re
 `FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6 default)`. An explicit `FA2_FP8KV=1` with `PTH_FA=1` is refused
 before either plugin is probed (`resolve_config.sh`); `FA2_FP8KV=0` is accepted.
 
-**Boot log, this branch's image (`PTH_FA=1`, the sitting below):** `Using AttentionBackendEnum.CUSTOM
+**Boot log, this branch's image (`PTH_FA=1`, the 2026-10-17 daytime sitting below):** `Using AttentionBackendEnum.CUSTOM
 backend.` four times, for the target and for the drafter on each of the two ranks, and no
 `Using TRITON_ATTN attention backend` line (the target-only arm has one, the drafter's autoselect); the
 engine's speculative config carries `'attention_backend': 'CUSTOM'` and the cache is
@@ -373,7 +374,7 @@ cases on this image, including the 14 of part 4 (the drafter's shapes, windowed 
 an fp64 reference, with blocks below the window on vLLM's null block; max error 0.52 of the tolerance),
 and `pthfa/tests/gate_test.py` passes all 34 checks with the GPU visible.
 
-**Target on the kernel, drafter on `TRITON_ATTN` (the parent branch's setting), measured on two RTX 3080
+**Target on the kernel, drafter on `TRITON_ATTN` (the target-only configuration), measured on two RTX 3080
 20 GB (sm86) at TP=2, the PR author's box, not on the reference 3090:** the same box as above (Linux in a
 Proxmox LXC container, driver 615.71.09, PCIe without P2P). Capped state (220 W, 1905 MHz lock), vLLM
 0.31.0, text-only, k=7 with lookup drafting on, `PREFIX_CACHE=1 MAX_SEQS=2 MAX_LEN=262144 GPU_UTIL=0.94
@@ -385,12 +386,12 @@ and `syvai/qwen3.8-27b-3090-fast-variant` (int4-GPTQ lm_head and MTP module, dra
 drafter `models/Qwen3.8-27B-DFlash2-W4A16`, fetched by `prepare/fetch_dflash2.py` from
 `syvai/Qwen3.8-27B-DFlash2-W4A16`.
 
-Two sittings on 2026-10-17, each with `main`'s image on `TRITON_ATTN` (the arm without the knob, built
-from 95ee3b6) as the same-sitting control, run first and repeated last for drift. First sitting: the
-parent branch's image built at 8b55d4a with `PTH_FA=1`. 8b55d4a is the parent branch before its last
-commit (a61f0a6), which adds refusals, tests and docs only: the argv of this arm and the `pthfa/` files
-are the same. Second sitting: the image built at a61f0a6, the same launch, to confirm the parent's final
-commit. Distinct 8k / 32k / 128k prompts (the same prompts in both sittings), 256 tokens out, greedy;
+Two sittings on 2026-10-17, in the morning (04:56-08:45 box time) and during the day (10:30-16:35), each with
+`main`'s image on `TRITON_ATTN` (the arm without the knob, built
+from 95ee3b6) as the same-sitting control, run first and repeated last for drift. Morning sitting: an
+image of the target-only configuration built at 8b55d4a with `PTH_FA=1`. Daytime sitting: the same
+configuration built at a61f0a6, which adds refusals, tests and docs only (the argv of this arm and the
+`pthfa/` files are the same), the same launch. Distinct 8k / 32k / 128k prompts (the same prompts in both), 256 tokens out, greedy;
 medians of 3 reps (8k: 5) unless the row says n; ratio `CUSTOM` / `TRITON_ATTN` of the same sitting, 95%
 CI in brackets:
 
@@ -422,27 +423,32 @@ FlashAttention-2 (`FA2_FP8KV=1`, above), not `TRITON_ATTN` int8; `PTH_FA=1` repl
 on this kernel. They were measured back to back in a third sitting, 2026-10-17 20:11 to 2026-10-18 03:08, same box, capped
 state, launch shape and prompts as above: `main`'s image before the FA2 merge (built from 95ee3b6) on
 `TRITON_ATTN` int8, the FA2 change's own image (built from its head 71253a4) with no knob set, which
-resolves to the FA2 default on this box, and this branch's image built at a61f0a6 with `PTH_FA=1`. Each had
-the full gate set; medians of 3 reps (8k: 5), cold TTFT n=1, 95% CI in brackets:
+resolves to the FA2 default on this box, the target-only image built at a61f0a6 and this branch's image
+(target and drafter), both with `PTH_FA=1`. Each had the full gate set; medians of 3 reps (8k: 5), cold
+TTFT n=1, 95% CI in brackets:
 
-| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long`, 2026-10-17 | `TRITON_ATTN` int8 (`FA2_FP8KV=0`) | `FLASH_ATTN` fp8 (the 8.6 default) | `CUSTOM` target (`PTH_FA=1`) | `CUSTOM` / FA2 | FA2 / `TRITON_ATTN` |
-|---|---|---|---|---|---|
-| 1 stream decode at 128k / 32k / 8k | 58.6 / 102.0 / 137.1 tok/s | 81.5 / 110.8 / 134.2 tok/s | 108.4 / 127.5 / 148.5 tok/s | 1.33 [1.18-1.41] / 1.15 [1.09-1.25] / 1.11 [0.99-1.14] | 1.39 [1.33-1.60] / 1.09 [0.89-1.12] / 0.98 [0.92-1.03] |
-| ms per forward pass, same | 55.0 / 31.0 / 25.1 | 36.8 / 28.8 / 25.0 | 29.0 / 24.6 / 23.4 | 0.789 [0.788-0.793] / 0.854 [0.844-0.857] / 0.936 [0.932-0.950] | 0.669 [0.664-0.678] / 0.931 [0.921-0.938] / 0.995 [0.989-1.004] |
-| 2 streams, per stream, same | 32.7 / 50.5 / 78.9 tok/s | 39.3 / 54.4 / 77.0 tok/s | 54.6 / 69.9 / 82.0 tok/s | 1.39 [1.32-1.41] / 1.29 [1.17-1.38] / 1.07 [1.01-1.15] | 1.20 [1.16-1.23] / 1.08 [0.90-1.13] / 0.98 [0.92-1.03] |
-| ms per forward pass, 2 streams | 63.3 / 35.9 / 29.3 | 54.1 / 38.6 / 30.7 | 39.0 / 30.3 / 28.0 | 0.720 [0.717-0.729] / 0.785 [0.777-0.788] / 0.912 [0.908-0.916] | 0.855 [0.842-0.863] / 1.073 [1.064-1.074] / 1.048 [0.988-1.058] |
-| TTFT cold, 128k / 32k / 8k | 249.6 / 27.8 / 6.22 s | 114.1 / 18.3 / 5.85 s | 122.3 / 18.7 / 5.45 s | 1.071 / 1.024 / 0.931 | 0.457 / 0.657 / 0.940 |
-| KV pool at `MAX_LEN=262144` | 477,599 tokens | 517,656 tokens | 504,770 tokens | 0.975 | 1.084 |
-| accepted length per draft (of 7), GSM8K window | 4.794 | 4.838 | 4.811 | 0.994 | 1.009 |
-| GSM8K n=200, greedy | 0.955 | 0.955 | 0.955 | 0 pt | 0 pt |
-| residue sweep, 128 prompt-length residues | 0 broken | 0 broken | 0 broken | | |
+| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long`, 2026-10-17 | `TRITON_ATTN` int8 (`FA2_FP8KV=0`) | `FLASH_ATTN` fp8 (the 8.6 default) | `CUSTOM` target only (`PTH_FA=1`) | `CUSTOM` target and drafter (`PTH_FA=1`) | target only / FA2 | target and drafter / FA2 | FA2 / `TRITON_ATTN` |
+|---|---|---|---|---|---|---|---|
+| 1 stream decode at 128k / 32k / 8k | 58.6 / 102.0 / 137.1 tok/s | 81.5 / 110.8 / 134.2 tok/s | 108.4 / 127.5 / 148.5 tok/s | 115.1 / 129.5 / 151.6 tok/s | 1.33 [1.18-1.41] / 1.15 [1.09-1.25] / 1.11 [0.99-1.14] | 1.41 [1.23-1.45] / 1.17 [1.13-1.29] / 1.13 [1.00-1.19] | 1.39 [1.33-1.60] / 1.09 [0.89-1.12] / 0.98 [0.92-1.03] |
+| ms per forward pass, same | 55.0 / 31.0 / 25.1 | 36.8 / 28.8 / 25.0 | 29.0 / 24.6 / 23.4 | 28.4 / 24.0 / 22.8 | 0.789 [0.788-0.793] / 0.854 [0.844-0.857] / 0.936 [0.932-0.950] | 0.770 [0.769-0.779] / 0.832 [0.818-0.837] / 0.913 [0.908-0.920] | 0.669 [0.664-0.678] / 0.931 [0.921-0.938] / 0.995 [0.989-1.004] |
+| 2 streams, per stream, same | 32.7 / 50.5 / 78.9 tok/s | 39.3 / 54.4 / 77.0 tok/s | 54.6 / 69.9 / 82.0 tok/s | 55.7 / 67.1 / 85.3 tok/s | 1.39 [1.32-1.41] / 1.29 [1.17-1.38] / 1.07 [1.01-1.15] | 1.42 [1.32-1.50] / 1.23 [1.19-1.39] / 1.11 [1.05-1.18] | 1.20 [1.16-1.23] / 1.08 [0.90-1.13] / 0.98 [0.92-1.03] |
+| ms per forward pass, 2 streams | 63.3 / 35.9 / 29.3 | 54.1 / 38.6 / 30.7 | 39.0 / 30.3 / 28.0 | 38.2 / 29.3 / 27.2 | 0.720 [0.717-0.729] / 0.785 [0.777-0.788] / 0.912 [0.908-0.916] | 0.707 [0.702-0.716] / 0.759 [0.754-0.769] / 0.887 [0.883-0.897] | 0.855 [0.842-0.863] / 1.073 [1.064-1.074] / 1.048 [0.988-1.058] |
+| TTFT cold, 128k / 32k / 8k | 249.6 / 27.8 / 6.22 s | 114.1 / 18.3 / 5.85 s | 122.3 / 18.7 / 5.45 s | 122.1 / 18.7 / 5.62 s | 1.071 / 1.024 / 0.931 | 1.070 / 1.022 / 0.961 | 0.457 / 0.657 / 0.940 |
+| KV pool at `MAX_LEN=262144` | 477,599 tokens | 517,656 tokens | 504,770 tokens | 504,770 tokens | 0.975 | 0.975 | 1.084 |
+| accepted length per draft (of 7), GSM8K window | 4.794 | 4.838 | 4.811 | 4.835 | 0.994 | 0.999 | 1.009 |
+| GSM8K n=200, greedy | 0.955 | 0.955 | 0.955 | 0.965 | 0 pt | +1.0 pt | 0 pt |
+| residue sweep, 128 prompt-length residues | 0 broken | 0 broken | 0 broken | 0 broken | | | |
 
-Needles at 50% and 90% of 128k retrieved, determinism at 1k/8k/32k passing and no preemption in all three.
-Where FA2 is ahead: the cold 128k prefill is 6.7% shorter (the ladder's 128k TTFT ratio is 1.071
-[1.070-1.072]) and its pool is 2.6% larger. Per decode pass at one stream the kernel takes 21% less time than FA2 at
-128k and 6% less at 8k; at two streams FA2 takes longer per pass than `TRITON_ATTN` at 32k (1.073
+Needles at 50% and 90% of 128k retrieved, determinism at 1k/8k/32k passing and no preemption in all four.
+Where FA2 is ahead: the cold 128k prefill is 6.7% shorter than with the target only on the kernel and
+6.5% shorter than with both (the ladder's 128k TTFT ratios are 1.071 [1.070-1.072] and 1.072
+[1.071-1.074]), and its pool is 2.6% larger. Per decode pass at one stream the target-only configuration
+takes 21% less time than FA2 at 128k and 6% less at 8k, the target and drafter configuration 23% and 9%
+less; the two kernel configurations differ by 1.9-3.4% per pass (0.966-0.981), as in the 2026-10-17
+daytime sitting; at two streams FA2 takes longer per pass than `TRITON_ATTN` at 32k (1.073
 [1.064-1.074]) and at 8k (1.048, CI including 1). On the ladder's 128k
-prompt FA2 accepts 3.012 tokens per step against 3.108 here (the same in both FA2 boots), so the 128k
+prompt FA2 accepts 3.012 tokens per step against 3.108 (target only) and 3.200 (target and drafter), the
+same in both FA2 boots, so the 128k
 tok/s ratio carries that prompt's acceptance; ms per pass does not. A second boot of the FA2 image
 reproduced its ms per pass within about 1%, and the control repeated last within 2%.
 
@@ -450,7 +456,8 @@ reproduced its ms per pass within about 1%, and the control repeated last within
 (30,616 and 127,937 scored positions) against a reference with bf16 KV on `FLASH_ATTN` (the launcher's
 `CTX=fast` on `main`'s image, same checkpoints), all boots at `MAX_LEN=135168 GPU_UTIL=0.88`, 2026-10-18.
 Mean |delta logprob| of the actual token, 32k / 128k: `TRITON_ATTN` int8 0.0219 / 0.0194, `PTH_FA=1` int8
-0.0207 / 0.0193, FA2 fp8 0.0360 / 0.0338 (p99 0.156 / 0.152, 0.150 / 0.150, 0.268 / 0.274). A
+0.0207 / 0.0193 (target only and target and drafter, identical on every position: the drafter does not
+touch prompt logprobs), FA2 fp8 0.0360 / 0.0338 (p99 0.156 / 0.152, 0.150 / 0.150, 0.268 / 0.274). A
 non-inferiority test (the new arm's mean |delta| at most the old arm's plus max(10% of it, 0.002 nats),
 on the point estimates over all scored positions and over the last 2048, with a 95% CI of the paired
 per-position difference from a non-overlapping block bootstrap, blocks of 256 and 1024 positions):
@@ -460,30 +467,31 @@ per-position difference from a non-overlapping block bootstrap, blocks of 256 an
 **The T4 battery** (`bench/t4_battery.py`, its own configuration: `MAX_SEQS=4 GPU_UTIL=0.93`, max model
 length 131072, 2048 batched tokens, ~60k and ~90k prompts, so not comparable with the tables above),
 2026-10-18, same box and state, three arms: `TRITON_ATTN` int8 and FA2 fp8 on the image of the FA2
-change, and the int8 kernel on an image that puts the DFlash2 drafter on the kernel as well (the
-target-only configuration of this section was not run through the battery). Every bar passes for all
-three: GSM8K 0.960 / 0.955 / 0.965, perplexity over the whole set 8.4013 / 8.4020 / 8.4022, 0 of 128 residues broken, soak exits 0 (FA2 60 min, the kernel 240 min; the battery soaks no int8
-Triton arm). Decode at ~60k 55.3 / 69.5 / 81.7 tok/s and at ~90k 44.2 / 62.2 / 76.1 tok/s, i.e. the
+change, and the int8 kernel with the target and the drafter on it (this branch's measured image; the
+target-only configuration was not run through the battery). Every bar passes for all
+three: GSM8K 0.960 / 0.955 / 0.965, perplexity over the whole set 8.4013 / 8.4020 / 8.4022, 0 of 128
+residues broken, soak exits 0 (FA2 60 min, the kernel 240 min; the battery soaks no int8 Triton arm).
+Decode at ~60k 55.3 / 69.5 / 81.7 tok/s and at ~90k 44.2 / 62.2 / 76.1 tok/s, i.e. the
 kernel +17.6% and +22.3% over FA2; cold TTFT at ~60k 76.0 / 46.8 / 49.1 s (FA2 4.9% shorter than the
 kernel). One run per arm, no CIs. The corpus was a stand-in, this repo's markdown, because the battery's
 usual corpus was not on this box; the arms share it, absolute numbers are not comparable with other
 machines'.
 
-**Target and drafter on the kernel (`PTH_FA=1` on this branch's image), measured in the second sitting
-above** (2026-10-17, same box, capped state, launch shape and prompts): `main`'s image on `TRITON_ATTN`
-(built from 95ee3b6, the control), this branch's image with `PTH_FA=1`, the parent branch's image at
-a61f0a6 with `PTH_FA=1` (target only), each with the full gate set; then a second boot of each of the two
+**Target and drafter on the kernel (`PTH_FA=1` on this branch's image), measured in the 2026-10-17
+daytime sitting above** (10:30-16:35, same box, capped state, launch shape and prompts): `main`'s image on `TRITON_ATTN`
+(built from 95ee3b6, the control), this branch's image with `PTH_FA=1`, the target-only image at
+a61f0a6 with `PTH_FA=1`, each with the full gate set; then a second boot of each of the two
 `CUSTOM` images (ladders and TTFT only, 5 reps), and the control's ladders again last. The measured image
 vendors pth-flash-attn 07e5063; this branch pins a31d8ab, which differs from it in comments and
 docstrings only (the Python modules have equal syntax trees without docstrings, the C++/CUDA files are
 token for token the same without comments, and the exported sources compile to the same SASS), and its
-launcher gives the measured launch the same argv as this branch's (which adds the `DYNAMIC_K` refusal
-only; `DYNAMIC_K` was unset). Medians of the first boot of each arm (3 reps, 8k: 5); the "both / target
-only" column pools
-the two boots of each `CUSTOM` arm (8 reps, 8k: 10), the "both / `TRITON_ATTN`" column is the first boots;
-95% CI in brackets:
+launcher gives the measured launch the same argv as this branch's (which adds the target-only
+configuration's `DYNAMIC_K` refusal and 8.6 override; `DYNAMIC_K` was unset, and with `PTH_FA=1` the
+override leaves the argv as measured on an 8.6 GPU). Medians of the first boot of each arm (3 reps, 8k: 5); the "both / target
+only" column pools the two boots of each `CUSTOM` arm (8 reps, 8k: 10), the "both / `TRITON_ATTN`"
+column is the first boots; 95% CI in brackets:
 
-| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | `TRITON_ATTN` (int8, `main`'s image) | `CUSTOM` target only (parent branch at a61f0a6) | `CUSTOM` target and drafter (`PTH_FA=1`) | both / target only | both / `TRITON_ATTN` |
+| capped, 2x RTX 3080 20 GB, TP=2, vLLM 0.31.0, `SPEC=dflash2 CTX=long` | `TRITON_ATTN` (int8, `main`'s image) | `CUSTOM` target only (image at a61f0a6) | `CUSTOM` target and drafter (`PTH_FA=1`) | both / target only | both / `TRITON_ATTN` |
 |---|---|---|---|---|---|
 | TTFT 128k cold (n=1) / 32k warm (n=5) / 8k warm (n=7) | 249.6 / 31.01 / 5.93 s | 122.4 / 23.21 / 5.47 s | 122.2 / 23.10 / 5.43 s | 0.998 / 0.996 [0.80-1.24] / 0.992 [0.989-0.996] (first boots) | 0.490 / 0.745 [0.60-0.89] / 0.915 [0.913-0.919] |
 | 1 stream decode at 128k / 32k / 8k | 59.1 / 102.2 / 138.1 tok/s | 107.3 / 127.2 / 147.3 tok/s | 115.8 / 129.4 / 151.3 tok/s | 1.054 [1.002-1.087] / 1.033 [0.992-1.081] / 1.025 [0.945-1.115] | 1.96 [1.86-2.05] / 1.27 [1.09-1.32] / 1.10 [0.97-1.16] |
