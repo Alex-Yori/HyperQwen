@@ -1506,9 +1506,15 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     `--attention-backend CUSTOM` stops at model load with `pth_flash_attn does not support: <what>`,
     and a sliding window or non-causal layer at head size 64 or 256 is refused at backend selection
     with `... at head size <D> (the windowed kernels exist for D = 128 only)`
-    (`pthfa/tests/gate_test.py` checks each reason); nothing ever selects `CUSTOM` on its own, so
+    (`pthfa/tests/gate_test.py` checks each reason); nothing in vLLM selects `CUSTOM` on its own, so
     an arm that does not ask for it cannot reach it. That is why the knob is gated to
-    `SPEC=mtp CTX=long` and `SPEC=dflash2 CTX=long`. On both, the target and the drafter run
+    `SPEC=mtp CTX=long` and `SPEC=dflash2 CTX=long`, and why its default is narrower still: an unset
+    `PTH_FA` resolves to 1 only on `SPEC=dflash2 CTX=long`, on a compute capability 8.6 GPU (the only
+    one measured), with the package installed and the measured setup (no explicit `FA2_FP8KV`, KV offload
+    tier or connector, backend flags in `EXTRA_ARGS`, `DRAFT`, `DRAFT_METHOD`, `DFLASH_TOKENS`, `LOOKUP=0`,
+    `DYNAMIC_K` or `VISION=1`); anything else keeps the arm's own default without a word, a missing install
+    says so once, and `PTH_FA=0` opts out. The effective-config line says `PTH_FA=1 (default; ...)` or
+    `(explicit; ...)`. On both arms the target and the drafter run
     `CUSTOM`: a drafter takes its backend from the speculative config, so the knob writes
     `"attention_backend":"CUSTOM"` there as well as `--attention-backend CUSTOM`. It writes no
     `kv_cache_dtype` into the speculative config, so the drafter's cache keeps the target's
@@ -1517,10 +1523,11 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     offload tier (`KV_OFFLOAD_GB`); `--attention-backend`, `--kv-cache-dtype` or
     `--speculative-config` in `EXTRA_ARGS`, which would silently override what the knob sets (the
     speculative config is where the drafter's `"attention_backend":"CUSTOM"` lives, and dropping it
-    puts the drafter on another backend); an explicit `FA2_FP8KV=1`, the other knob that picks the
-    dflash2 backend (an unset one, which defaults to 1 on that arm on a compute capability 8.6 GPU, is
-    overridden: `PTH_FA=1` keeps it at 0, and the effective-config line reads `FA2_FP8KV=0 (PTH_FA=1
-    overrides the 8.6 default)`); and on dflash2 any drafting setup but the measured one: `DRAFT_METHOD` other than
+    puts the drafter on another backend); an explicit `FA2_FP8KV=1` with an explicit `PTH_FA=1`, the
+    other knob that picks the dflash2 backend (an unset one, which defaults to 1 on that arm on a compute
+    capability 8.6 GPU, is overridden: `PTH_FA=1`, set or defaulted, keeps it at 0, and the effective-config
+    line reads `FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6 default)`); and on dflash2 any drafting setup but
+    the measured one: `DRAFT_METHOD` other than
     `dflash` (a different drafter), `DFLASH_TOKENS` other than 7 (a different verify block on the
     target, adaptive in length above 7), `LOOKUP=0` and `DYNAMIC_K` (a draft count per batch size,
     which varies the verify block). `VISION=1` on dflash2 is accepted but

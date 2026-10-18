@@ -39,12 +39,15 @@
 #   not as the fast path. Numbers in gotcha 40.
 # FA2_FP8KV (default 1 on SPEC=dflash2 CTX=long on a compute capability 8.6 GPU): fp8 KV with the
 #   FA2 plugin (fa2/, bash fa2/install.sh) instead of int8 + Triton. FA2_FP8KV=0 restores int8 +
-#   Triton, and KV_OFFLOAD_GB, PTH_FA=1 or another GPU turns the default off. See the arm below.
+#   Triton, and KV_OFFLOAD_GB, PTH_FA (set or defaulted to 1) or another GPU turns the default off.
+#   See the arm below.
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/), 200k context with MTP, at roughly
 #   half the decode rate past 100k — see below and docs/long-context.md.
-# PTH_FA=1 (SPEC=mtp CTX=long and SPEC=dflash2 CTX=long only, default 0): int8 per-token-head KV read
-#   by the pth-flash-attn kernel (pthfa/), on the target and the MTP drafter instead of fp8 on FlashInfer,
-#   or on the DFlash2 target and drafter instead of TRITON_ATTN — see below.
+# PTH_FA (SPEC=mtp CTX=long and SPEC=dflash2 CTX=long only): int8 per-token-head KV read by the
+#   pth-flash-attn kernel (pthfa/), on the target and the MTP drafter instead of fp8 on FlashInfer,
+#   or on the DFlash2 target and drafter instead of TRITON_ATTN — see below. Default 0, except 1 on
+#   SPEC=dflash2 CTX=long on a compute capability 8.6 GPU with the package installed and the measured
+#   setup (resolve_config.sh); PTH_FA=0 opts out.
 #
 # Fast variant: MODEL defaults to models/Qwen3.8-27B-W4A16-AutoRound-fast when it
 # exists (int4-GPTQ lm_head + MTP, own-output draft vocab; drafter/README.md), else
@@ -287,9 +290,10 @@ fi
 # 115.1 tok/s with PTH_FA=1, 81.5 on the FA2 fp8 default, 58.6 on TRITON_ATTN int8; ms per pass 28.4 /
 # 36.8 / 55.0; FA2 has the shorter cold 128k prefill (114.1 against 122.1 s) and the larger KV pool
 # (517,656 against 504,770 tokens) (docs/long-context.md).
-# On a compute capability 8.6 GPU this arm defaults to FA2_FP8KV=1 (fp8 KV on the FA2 plugin, above).
-# PTH_FA=1 overrides that default and refuses an explicit FA2_FP8KV=1; both happen in resolve_config.sh,
-# before the FA2 block above, so with PTH_FA=1 FA2_FP8KV is never 1 here.
+# On a compute capability 8.6 GPU this arm defaults to PTH_FA=1 when the package is installed and the launch
+# is the measured one, and otherwise to FA2_FP8KV=1 (fp8 KV on the FA2 plugin, above). PTH_FA=1, set or
+# defaulted, overrides the FA2 default, and an explicit FA2_FP8KV=1 with an explicit PTH_FA=1 is refused; all
+# of it happens in resolve_config.sh, before the FA2 block above, so with PTH_FA=1 FA2_FP8KV is never 1 here.
 PTH_FA=${PTH_FA:-0}
 PTH_SPEC_BACKEND=
 if [ "$PTH_FA" = 1 ]; then
@@ -334,9 +338,7 @@ if [ "$PTH_FA" = 1 ]; then
       echo "  untested on this backend; refusing. Use PTH_FA=0 for a CPU KV tier." >&2
       exit 1 ;;
   esac
-  "$REPO/venv/bin/python" -c 'import importlib.util as u, os, sys
-s = u.find_spec("pth_flash_attn")
-sys.exit(0 if s and os.path.isfile(os.path.join(s.submodule_search_locations[0], "_C.abi3.so")) else 1)' 2>/dev/null || {
+  pthfa_installed || {
     echo "PTH_FA=1 needs the pth_flash_attn package and its op library in the venv: bash pthfa/install.sh" >&2
     echo "  (the Docker image has it), or PTH_FA=0." >&2
     exit 1

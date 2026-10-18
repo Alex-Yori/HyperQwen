@@ -7,9 +7,12 @@
 # connector, a missing install, a value other than 0/1, FA2_FP8KV=1 alongside it and, on dflash2, a drafting setup
 # other than the measured one (DRAFT_METHOD, DFLASH_TOKENS, LOOKUP, DYNAMIC_K) are refused, each with its own
 # message; batch mode warns and ignores it. On a compute capability 8.6 host (a stub nvidia-smi), where
-# SPEC=dflash2 CTX=long defaults to FA2_FP8KV=1: with no knob that default runs, PTH_FA=1 overrides it (the argv
-# and VLLM_* environment of PTH_FA=1 FA2_FP8KV=0), an explicit FA2_FP8KV=1 with PTH_FA=1 is refused before either
-# plugin is probed, and on 8.9 nothing changes. Copies
+# SPEC=dflash2 CTX=long defaults to PTH_FA=1 with the package installed and the measured setup: an unset or empty
+# PTH_FA gives the argv and VLLM_* environment of an explicit PTH_FA=1; PTH_FA=0, a missing install (one note),
+# an explicit FA2_FP8KV and every conflicting or unmeasured setting keep the arm's own default, the FA2 one, with
+# the argv, environment and stderr of PTH_FA=0 (no refusal); an explicit FA2_FP8KV=1 with PTH_FA=1 is refused
+# before either plugin is probed; on 8.0, 8.9, 9.0 or no answer, and on every other arm, nothing changes. Every
+# run gets a stub nvidia-smi that answers nothing unless it passes another. Copies
 # the checkout, without its own venv, to a temp dir and runs the launchers against a stub vllm (prints its argv,
 # then "@@ENV" and its VLLM_* environment) and a stub venv python (answers the install probes from
 # PTHFA_STUB_INSTALLED and FA2_STUB_INSTALLED, and passes anything else to python3). No GPU, no model, no network.
@@ -40,14 +43,21 @@ stage() {
   chmod +x "$2/venv/bin/vllm" "$2/venv/bin/python"
 }
 stage "$REPO" "$T/new"
+# smi <cap>: PATH=<dir>:$PATH, where <dir>/nvidia-smi answers <cap> to resolve_config.sh's compute_cap query;
+# "none" answers nothing and fails, as on a host without a GPU driver.
+smi() { mkdir -p "$T/smi-$1"
+  if [ "$1" = none ]; then printf '#!/bin/sh\nexit 9\n'; else printf '#!/bin/sh\necho %s\n' "$1"; fi > "$T/smi-$1/nvidia-smi"
+  chmod +x "$T/smi-$1/nvidia-smi"; echo "PATH=$T/smi-$1:$PATH"; }
+SNONE=$(smi none)
 # run <tree> <launcher> <env...>: argv and VLLM_* environment on stdout (stub vllm), stderr in $T/err, exit code
-# in $T/rc.
-# FA2_FP8KV=0: an unset knob resolves from the host's GPU (1 on SPEC=dflash2 CTX=long on compute capability 8.6),
+# in $T/rc. The host's own nvidia-smi is never asked: every run gets the "none" stub unless it passes another.
+# FA2_FP8KV=0: an unset knob resolves from the GPU (1 on SPEC=dflash2 CTX=long on compute capability 8.6),
 # so every run pins it but those that pass FA2_FP8KV= with a stub nvidia-smi (the 8.6 block below).
 run() { local tree=$1 sc=$2; shift 2
   (cd "$tree" && env -u PRINT_ARGV -u PTH_FA -u KV_OFFLOAD_GB -u EXTRA_ARGS -u SPEC -u CTX -u PYTORCH_CUDA_ALLOC_CONF \
      -u WSL_DISTRO_NAME -u CUDA_HOME -u FA2_FP8KV -u DRAFT_METHOD -u DFLASH_TOKENS -u LOOKUP -u VISION -u DYNAMIC_K \
-     VLLM_API_KEY=k FA2_FP8KV=0 "$@" bash "$sc" 2>"$T/err" </dev/null); echo $? > "$T/rc"; }
+     -u DRAFT -u DRAFT_TOKENS -u CUDA_VISIBLE_DEVICES \
+     VLLM_API_KEY=k FA2_FP8KV=0 "$SNONE" "$@" bash "$sc" 2>"$T/err" </dev/null); echo $? > "$T/rc"; }
 rc() { cat "$T/rc"; }
 # after <flag>: the argument that follows <flag> in the argv on stdin ("none" if absent; every value if repeated).
 after() { local v; v=$(sed -n "/^$1\$/{n;p;}" | tr '\n' ' ' | sed 's/ $//'); echo "${v:-none}"; }
@@ -166,20 +176,10 @@ check 0 "$(rc)" "KV_OFFLOAD_GB=0 is no tier: boots"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 KV_OFFLOAD_GB=0 >/dev/null
 check 0 "$(rc)" "dflash2: KV_OFFLOAD_GB=0 is no tier: boots"
 
-echo "== compute capability 8.6 host (stub nvidia-smi), FA2_FP8KV unset: the FA2 default, and PTH_FA=1 over it"
-# smi <cap>: PATH=<dir>:$PATH, where <dir>/nvidia-smi answers <cap> to resolve_config.sh's compute_cap query.
-smi() { mkdir -p "$T/smi-$1"; printf '#!/bin/sh\necho %s\n' "$1" > "$T/smi-$1/nvidia-smi"; chmod +x "$T/smi-$1/nvidia-smi"
-  echo "PATH=$T/smi-$1:$PATH"; }
-S86=$(smi 8.6); S89=$(smi 8.9)
+echo "== compute capability 8.6 host (stub nvidia-smi), FA2_FP8KV unset: PTH_FA defaults to 1 on SPEC=dflash2 CTX=long"
+S86=$(smi 8.6); S89=$(smi 8.9); S80=$(smi 8.0); S90=$(smi 9.0)
 OVR="PTH_FA=1 overrides the 8.6 default"
-run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$S86" > "$T/f0"; cp "$T/err" "$T/f0.err"
-check "0 FLASH_ATTN fp8" "$(rc) $(after --attention-backend < "$T/f0") $(after --kv-cache-dtype < "$T/f0")" \
-  "no knob: the FA2 default runs (fp8 KV on FLASH_ATTN)"
-grep -qF '[effective-config] CTX=long SPEC=dflash2 FA2_FP8KV=1 (default)' "$T/f0.err" \
-  && check 1 1 "no knob: the effective config says FA2_FP8KV=1 (default)" || check 1 0 "no knob: the effective config says FA2_FP8KV=1 (default)"
-run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= PTH_FA=0 "$S86" > "$T/f00"; cp "$T/err" "$T/f00.err"
-check "same same" "$(cmp -s "$T/f0" "$T/f00" && echo same || echo differs) $(cmp -s "$T/f0.err" "$T/f00.err" && echo same || echo differs)" \
-  "PTH_FA=0: the same argv, VLLM_* environment and stderr as no knob"
+NOTE="PTH_FA defaults to 1 on SPEC=dflash2 CTX=long on compute capability 8.6, but the pth_flash_attn package is not in the venv"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= PTH_FA=1 "$S86" > "$T/f1"; cp "$T/err" "$T/f1.err"
 check "0 same" "$(rc) $(cmp -s "$T/f1" "$T/don" && echo same || echo differs)" \
   "PTH_FA=1 boots with the argv and VLLM_* environment of PTH_FA=1 FA2_FP8KV=0"
@@ -187,6 +187,30 @@ grep -qF "[effective-config] CTX=long SPEC=dflash2 FA2_FP8KV=0 ($OVR)" "$T/f1.er
   && check 1 1 "PTH_FA=1: the effective config says it overrides the default" || check 1 0 "PTH_FA=1: the effective config says it overrides the default"
 grep -qF "[start_qwen] PTH_FA=1: FA2_FP8KV=0, $OVR" "$T/f1.err" \
   && check 1 1 "PTH_FA=1: the launcher says so" || check 1 0 "PTH_FA=1: the launcher says so"
+run "$T/new" single-user/start_qwen.sh SPEC=mtp CTX=long FA2_FP8KV= "$S86" > "$T/mdflt"; cp "$T/err" "$T/mdflt.err"
+check "0 fp8 none 0" "$(rc) $(after --kv-cache-dtype < "$T/mdflt") $(after --attention-backend < "$T/mdflt") $(grep -c PTH_FA "$T/mdflt.err")" \
+  "SPEC=mtp CTX=long, no knob on 8.6: no PTH_FA default (fp8 KV, FlashInfer, no PTH_FA line)"
+grep -qF "[effective-config] PTH_FA=1 (explicit; " "$T/f1.err" \
+  && check 1 1 "PTH_FA=1: the effective config says PTH_FA=1 (explicit)" || check 1 0 "PTH_FA=1: the effective config says PTH_FA=1 (explicit)"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$S86" > "$T/d1"; cp "$T/err" "$T/d1.err"
+check "0 same" "$(rc) $(cmp -s "$T/d1" "$T/f1" && echo same || echo differs)" \
+  "no knob: the argv and VLLM_* environment of PTH_FA=1 (target and drafter on CUSTOM)"
+check same "$(cmp -s <(sed 's/^\(\[effective-config\] PTH_FA=1 (\)explicit; /\1default; /' "$T/f1.err") "$T/d1.err" && echo same || echo differs)" \
+  "no knob: the stderr of PTH_FA=1 but for (default) in its effective-config line"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= PTH_FA= "$S86" > "$T/d1e"; cp "$T/err" "$T/d1e.err"
+check "same same" "$(cmp -s "$T/d1e" "$T/d1" && echo same || echo differs) $(cmp -s "$T/d1e.err" "$T/d1.err" && echo same || echo differs)" \
+  "PTH_FA= (empty) is the same as unset"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= PTH_FA=0 "$S86" > "$T/f0"; cp "$T/err" "$T/f0.err"
+check "0 FLASH_ATTN fp8" "$(rc) $(after --attention-backend < "$T/f0") $(after --kv-cache-dtype < "$T/f0")" \
+  "PTH_FA=0 (opt out): the FA2 default runs (fp8 KV on FLASH_ATTN)"
+grep -qF '[effective-config] CTX=long SPEC=dflash2 FA2_FP8KV=1 (default)' "$T/f0.err" \
+  && check 1 1 "PTH_FA=0: the effective config says FA2_FP8KV=1 (default)" || check 1 0 "PTH_FA=0: the effective config says FA2_FP8KV=1 (default)"
+check "0 0" "$(grep -c 'PTH_FA' "$T/f0.err") $(grep -cF "$NOTE" "$T/f0.err")" "PTH_FA=0: no PTH_FA line, no note"
+run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= PTHFA_STUB_INSTALLED=0 "$S86" > "$T/f00"; cp "$T/err" "$T/f00.err"
+check "0 same" "$(rc) $(cmp -s "$T/f00" "$T/f0" && echo same || echo differs)" \
+  "no package: no refusal, the argv and VLLM_* environment of PTH_FA=0 (the FA2 default)"
+check "1 same" "$(grep -cF "$NOTE" "$T/f00.err") $(cmp -s <(grep -vF "$NOTE" "$T/f00.err") "$T/f0.err" && echo same || echo differs)" \
+  "no package: the stderr of PTH_FA=0 plus one note"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV=0 PTH_FA=1 "$S86" > "$T/f10"; cp "$T/err" "$T/f10.err"
 check "0 same 0" "$(rc) $(cmp -s "$T/f10" "$T/don" && echo same || echo differs) $(grep -c "$OVR" "$T/f10.err")" \
   "PTH_FA=1 FA2_FP8KV=0 (explicit): boots, the same argv, no override line"
@@ -200,15 +224,62 @@ check "0 same 0 1" "$(rc) $(cmp -s "$T/f9" "$T/don" && echo same || echo differs
   "8.9: PTH_FA=1 boots, the same argv, the default is the FA2 block's own off (no override line)"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$S89" > "$T/f90"
 check "0 TRITON_ATTN" "$(rc) $(after --attention-backend < "$T/f90")" "8.9, no knob: int8 on TRITON_ATTN (control)"
+
+echo "== no PTH_FA default where the launch is not the measured one: the same exit code, argv, environment and stderr as PTH_FA=0"
+# keeps <why> <env...>: on the 8.6 stub with FA2_FP8KV unset (both overridable in <env>), <env> gives the exit code,
+# argv, VLLM_* environment and stderr of <env> PTH_FA=0: the arm's own default, without a word and without a refusal.
+keeps() { local why=$1 r1 r0; shift
+  run "$T/new" single-user/start_qwen.sh FA2_FP8KV= "$S86" "$@" > "$T/k1"; cp "$T/err" "$T/k1.err"; r1=$(rc)
+  run "$T/new" single-user/start_qwen.sh FA2_FP8KV= "$S86" "$@" PTH_FA=0 > "$T/k0"; cp "$T/err" "$T/k0.err"; r0=$(rc)
+  check "$r0 same same 0" "$r1 $(cmp -s "$T/k1" "$T/k0" && echo same || echo differs) $(cmp -s "$T/k1.err" "$T/k0.err" \
+    && echo same || echo differs) $(grep -c 'PTH_FA=1' "$T/k1.err")" "$why (exit $r1)"; }
+L2="SPEC=dflash2 CTX=long"
+keeps "explicit FA2_FP8KV=1: the FA2 arm"                $L2 FA2_FP8KV=1
+keeps "explicit FA2_FP8KV=0: int8 on TRITON_ATTN"         $L2 FA2_FP8KV=0
+keeps "KV_OFFLOAD_GB=8"                                   $L2 KV_OFFLOAD_GB=8
+keeps "EXTRA_ARGS --kv-transfer-config"                   $L2 EXTRA_ARGS="--kv-transfer-config {}"
+keeps "EXTRA_ARGS --kv-offloading-size"                   $L2 EXTRA_ARGS="--kv-offloading-size 4"
+keeps "EXTRA_ARGS --attention-backend"                    $L2 EXTRA_ARGS="--attention-backend TRITON_ATTN"
+keeps "EXTRA_ARGS --kv-cache-dtype"                       $L2 EXTRA_ARGS="--kv-cache-dtype=fp8"
+keeps "EXTRA_ARGS --speculative-config"                   $L2 EXTRA_ARGS="--speculative-config {}"
+keeps "DYNAMIC_K"                                         $L2 DYNAMIC_K='[[1,3,7],[4,512,3]]'
+keeps "DFLASH_TOKENS=15"                                  $L2 DFLASH_TOKENS=15
+keeps "DRAFT_METHOD=dspark"                               $L2 DRAFT_METHOD=dspark
+keeps "LOOKUP=0"                                          $L2 LOOKUP=0
+keeps "VISION=1"                                          $L2 VISION=1
+keeps "DRAFT set"                                         $L2 DRAFT="$T/new/models/Qwen3.8-27B-DFlash2-W4A16"
+keeps "nvidia-smi 8.0"                                    $L2 "$S80"
+keeps "nvidia-smi 8.9"                                    $L2 "$S89"
+keeps "nvidia-smi 9.0"                                    $L2 "$S90"
+keeps "no nvidia-smi answer"                              $L2 "$SNONE"
+for arm in "SPEC=mtp CTX=long" "SPEC=mtp CTX=fast" "SPEC=mtp CTX=huge" "SPEC=dflash2 CTX=fast" "SPEC=dflash2 CTX=huge" \
+           "SPEC=off CTX=long"; do
+  keeps "8.6, $arm" $arm
+done
+
 if [ -n "${PTHFA_BASE_TREE:-}" ]; then
+  echo "== against $PTHFA_BASE_TREE (FA2_FP8KV unset): no knob off 8.6 and PTH_FA=0 on 8.6 are byte for byte the base tree's"
   stage "$PTHFA_BASE_TREE" "$T/base86"
-  for c in 8.6 8.9; do cap=$(smi "$c")
-    run "$T/base86" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$cap" > "$T/x"; sed "s|$T/base86|TREE|g" "$T/err" > "$T/x.err"
-    run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long FA2_FP8KV= "$cap" > "$T/y"; sed "s|$T/new|TREE|g" "$T/err" > "$T/y.err"
+  # vsbase <why> <new-side env> -- <env...>: the base tree with <env> against this tree with <env> plus <new-side env>.
+  vsbase() { local why=$1 extra=$2; shift 2
+    run "$T/base86" single-user/start_qwen.sh FA2_FP8KV= "$@" > "$T/x"; sed "s|$T/base86|TREE|g" "$T/err" > "$T/x.err"
+    run "$T/new" single-user/start_qwen.sh FA2_FP8KV= "$@" $extra > "$T/y"; sed "s|$T/new|TREE|g" "$T/err" > "$T/y.err"
     sed -i "s|$T/base86|TREE|g" "$T/x"; sed -i "s|$T/new|TREE|g" "$T/y"
-    check "same same" "$(cmp -s "$T/x" "$T/y" && echo same || echo differs) $(cmp -s "$T/x.err" "$T/y.err" && echo same || echo differs)" \
-      "no knob, nvidia-smi $c: argv, VLLM_* environment and stderr against $PTHFA_BASE_TREE"
+    check "same same" "$(cmp -s "$T/x" "$T/y" && echo same || echo differs) $(cmp -s "$T/x.err" "$T/y.err" && echo same || echo differs)" "$why"; }
+  for c in 8.0 8.9 9.0 none; do cap=$(smi "$c")
+    for arm in "SPEC=dflash2 CTX=long" "SPEC=mtp CTX=long"; do vsbase "no knob, nvidia-smi $c, $arm" "" $arm "$cap"; done
   done
+  for arm in "SPEC=dflash2 CTX=long" "SPEC=mtp CTX=long"; do vsbase "PTH_FA=0, nvidia-smi 8.6, $arm" PTH_FA=0 $arm "$S86"; done
+  # SPEC=mtp CTX=long has no PTH_FA default: with no knob on 8.6 it is the base tree's launch byte for byte.
+  for arm in "SPEC=mtp CTX=long" "SPEC=mtp CTX=fast" "SPEC=mtp CTX=huge" "SPEC=dflash2 CTX=fast" "SPEC=dflash2 CTX=huge" \
+             "SPEC=off CTX=long"; do
+    vsbase "no knob, nvidia-smi 8.6, $arm" "" $arm "$S86"
+  done
+  run "$T/base86" single-user/start_qwen.sh FA2_FP8KV= SPEC=dflash2 CTX=long "$S86" > "$T/x"; sed "s|$T/base86|TREE|g" "$T/err" > "$T/x.err"
+  run "$T/new" single-user/start_qwen.sh FA2_FP8KV= SPEC=dflash2 CTX=long PTHFA_STUB_INSTALLED=0 "$S86" > "$T/y"
+  sed "s|$T/new|TREE|g" "$T/err" > "$T/y.err"; sed -i "s|$T/base86|TREE|g" "$T/x"; sed -i "s|$T/new|TREE|g" "$T/y"
+  check "same same" "$(cmp -s "$T/x" "$T/y" && echo same || echo differs) $(cmp -s "$T/x.err" <(grep -vF "$NOTE" "$T/y.err") && echo same || echo differs)" \
+    "no knob, nvidia-smi 8.6, no package: the base tree's argv and environment, its stderr plus the note"
 fi
 
 echo "== batch mode ignores it, and says so"
