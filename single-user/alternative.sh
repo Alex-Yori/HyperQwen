@@ -15,6 +15,7 @@ source "$(dirname "$(cd "$(dirname "$0")" && pwd)")/launcher_common.sh" \
   || { echo "[alternative] cannot source launcher_common.sh - refusing to boot" >&2; exit 1; }
 qwen_normalize_extra_args
 qwen_check_bool_knobs
+qwen_fa2_fp8kv_single_only alternative.sh
 qwen_kv_offload_args
 qwen_prefix_cache
 

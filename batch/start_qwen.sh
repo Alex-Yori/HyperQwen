@@ -77,6 +77,7 @@ source "$REPO/resolve_config.sh" \
 resolve_effective_config batch
 # KV_OFFLOAD_GB=N: the CPU KV tier as a flag, ahead of everything below that reads EXTRA_ARGS.
 qwen_check_bool_knobs
+qwen_fa2_fp8kv_single_only batch/start_qwen.sh
 qwen_kv_offload_args
 qwen_prefix_cache
 qwen_kv_offload_shm_check
