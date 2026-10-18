@@ -49,6 +49,8 @@ jobs:
         run: bash bench/test_fa2_fp8kv_knob.sh
       - name: Check the T4 battery's plan, restart gate and verdict without a GPU
         run: python bench/test_t4_battery.py
+      - name: Check PTH_FA in the launchers (argv, refusals, unset = unchanged) without a GPU
+        run: bash bench/test_pthfa_knob.sh
 
   kvarn-torch-gate:
     runs-on: ubuntu-latest
@@ -79,6 +81,8 @@ jobs:
           git diff --exit-code PATCHES.md || { echo "::error::PATCHES.md is not current: run python3 scripts/patches_md.py and commit the result"; exit 1; }
       - name: Check that a re-export keeps the file's preamble
         run: bash scripts/test_export_patch.sh
+      - name: Check the vendored pth-flash-attn sources in pthfa/ against pthfa/SHA256SUMS
+        run: bash pthfa/check_vendor.sh
 
   fa2-upstream:
     runs-on: ubuntu-latest
