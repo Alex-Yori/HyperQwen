@@ -181,8 +181,11 @@ resolves to 0, with a note, when `KV_OFFLOAD_GB` or a KV connector in `EXTRA_ARG
 plugin's backend supports only the LBNHC KV layout, vLLM's CPU-tier connector asks for LBHNC or
 BLHNC, and the CPU tier on this backend is untested, so the offload tier keeps int8 + Triton. An
 explicit `FA2_FP8KV=1` refuses that combination, and any other `SPEC` or `CTX`. `PTH_FA=1` (the
-pth-flash-attn kernel, below) is the other backend for this arm: with it an unset `FA2_FP8KV` stays
-0 on an 8.6 GPU too, and an explicit `FA2_FP8KV=1` alongside it is refused. The evidence is the
+pth-flash-attn kernel, below) is the other backend for this arm, and on an 8.6 GPU with the package
+installed it is this arm's default when the launch is the measured one: then an unset `FA2_FP8KV` stays
+0, and an explicit `FA2_FP8KV=1` with an explicit `PTH_FA=1` is refused. `PTH_FA=0`, an explicit
+`FA2_FP8KV`, a missing install or any setup the kernel was not measured with keeps the fp8 + FA2
+default described here. The evidence for that default is the
 T4 battery on the native 3090 ([#153](https://github.com/syv-ai/HyperQwen/issues/153)):
 on 2026-10-18 (bare metal, 250 W, vLLM 0.31.0) the fp8 + FA2 arm passed every bar against the shipped int8 + Triton arm: GSM8K 0.950 vs 0.955 (n=200), perplexity +0.04%, 0 of 128 residues broken, a 20-minute soak with no restart, decode 54.0 vs 48.2 tok/s at ~66k and 48.2 vs 37.9 tok/s at ~100k (+27%), cold TTFT 75.5 vs 132.3 s and 54.7 vs 130.5 s, and a 3.3% larger pool (140,902 vs 136,429 tokens).
 
@@ -356,11 +359,19 @@ setup other than the measured one, i.e. `DRAFT_METHOD` other than `dflash` (DSpa
 adaptive), `LOOKUP=0`, and `DYNAMIC_K` (a draft count per batch size, so the verify block's length varies
 with the batch). `VISION=1` is accepted and untested on this arm (gotcha 63).
 
-**On an 8.6 GPU `PTH_FA=1` overrides the FA2 default.** There an unset `FA2_FP8KV` resolves to 1 on this
-arm (fp8 KV on FlashAttention-2, above); with `PTH_FA=1` it stays 0, so the argv and the environment are
-the ones above on every card the kernel serves, and the effective-config line reads
-`FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6 default)`. An explicit `FA2_FP8KV=1` with `PTH_FA=1` is refused
-before either plugin is probed (`resolve_config.sh`); `FA2_FP8KV=0` is accepted.
+**On an 8.6 GPU this is the arm's default.** An unset or empty `PTH_FA` resolves to 1 on this arm when
+all of these hold: `nvidia-smi` reports compute capability 8.6 (the same query as the FA2 default; the only
+card family measured), the `pth_flash_attn` package and its op library are in the venv (the check
+`PTH_FA=1` makes), and nothing the user set picks something else or leaves the measured setup: no explicit
+`FA2_FP8KV` (1 is the FA2 arm, 0 the `TRITON_ATTN` int8 arm), no KV offload tier or connector, no
+`--attention-backend`, `--kv-cache-dtype` or `--speculative-config` in `EXTRA_ARGS`, no `DRAFT`, the DFlash2
+drafter at `DFLASH_TOKENS=7` with lookup on, no `DYNAMIC_K` and no `VISION=1`. Then the argv and the
+environment are those of an explicit `PTH_FA=1`, and the effective-config lines read
+`FA2_FP8KV=0 (PTH_FA=1 overrides the 8.6 default)` and `PTH_FA=1 (default; ...)`. Otherwise the arm's own
+default runs (fp8 KV on FlashAttention-2 on 8.6) with no message and never a refusal of `PTH_FA`'s;
+a missing install prints one line saying so. `PTH_FA=0` opts out. With an explicit `PTH_FA=1` the
+FA2 default is overridden the same way on any card the kernel serves, and an explicit `FA2_FP8KV=1` with
+it is refused before either plugin is probed (`resolve_config.sh`); `FA2_FP8KV=0` is accepted.
 
 **Boot log, this branch's image (`PTH_FA=1`, the 2026-10-17 daytime sitting below):** `Using AttentionBackendEnum.CUSTOM
 backend.` four times, for the target and for the drafter on each of the two ranks, and no

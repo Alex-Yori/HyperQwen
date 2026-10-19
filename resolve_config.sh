@@ -37,6 +37,14 @@ _warn() {
   echo "resolve_config: WARNING: $1" >&2
 }
 
+# pthfa_installed: the pth_flash_attn package and its op library are in the venv. The launcher's
+# PTH_FA=1 install check and the PTH_FA default below use this one probe.
+pthfa_installed() {
+  "$REPO/venv/bin/python" -c 'import importlib.util as u, os, sys
+s = u.find_spec("pth_flash_attn")
+sys.exit(0 if s and os.path.isfile(os.path.join(s.submodule_search_locations[0], "_C.abi3.so")) else 1)' 2>/dev/null
+}
+
 resolve_effective_config() {
   local mode=${1:?usage: resolve_effective_config batch|single}
   [ "$mode" = "batch" ] || [ "$mode" = "single" ] \
@@ -69,6 +77,44 @@ resolve_effective_config() {
     else case " ${EXTRA_ARGS:-} " in
       *"--kv-offloading-size"*|*"--kv-transfer-config"*) _fa2_tier="a KV connector in EXTRA_ARGS (--kv-offloading-size/--kv-transfer-config)" ;;
     esac; fi
+    # The GPU's compute capability, asked at most once: the PTH_FA and FA2_FP8KV defaults below both
+    # depend on it. nvidia-smi ignores CUDA_VISIBLE_DEVICES and orders GPUs differently from CUDA, so
+    # with no selection every GPU it lists must agree.
+    local _cap= _cap_asked=
+    _ask_cap() { [ -n "$_cap_asked" ] && return 0; _cap_asked=1
+      _cap=$(nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "${CUDA_VISIBLE_DEVICES%%,*}"} \
+        --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' \r' | sort -u); }
+    # PTH_FA (the int8 kernel, pthfa/) unset or empty means 1 on SPEC=dflash2 CTX=long when the launch is
+    # the measured one: a compute capability 8.6 GPU (the only one measured), the package installed, no
+    # backend the user picked (FA2_FP8KV set to 0 or 1), no KV offload tier or connector, no
+    # --attention-backend, --kv-cache-dtype or --speculative-config in EXTRA_ARGS, the default DFlash2
+    # drafter at DFLASH_TOKENS=7 with lookup on, no DYNAMIC_K and no VISION. Anything else keeps the arm's
+    # own default (FA2_FP8KV on 8.6) without a word: a default must not turn a launch that works into a
+    # refusal of PTH_FA=1. A missing install says so once. PTH_FA=0 opts out.
+    PTH_FA_SRC=explicit
+    if [ -z "${PTH_FA:-}" ]; then
+      PTH_FA_SRC=default
+      local _pth_arm=
+      case "$spec/$ctx" in
+        dflash2/long)
+          [ -z "${FA2_FP8KV:-}" ] && [ "${DRAFT_METHOD:-dflash}" = dflash ] && [ "${DFLASH_TOKENS:-7}" = 7 ] \
+            && [ "${LOOKUP:-1}" = 1 ] && [ "${VISION:-0}" != 1 ] && [ -z "${DRAFT:-}" ] \
+            && [ -f "$REPO/models/Qwen3.8-27B-DFlash2-W4A16/model.safetensors" ] \
+            && _pth_arm="SPEC=dflash2 CTX=long" ;;
+      esac
+      { [ -z "${DYNAMIC_K:-}" ] && [ -z "$_fa2_tier" ]; } || _pth_arm=
+      case " ${EXTRA_ARGS:-} " in
+        *" --attention-backend"*|*" --kv-cache-dtype"*|*" --speculative-config"*) _pth_arm= ;;
+      esac
+      if [ -n "$_pth_arm" ]; then
+        _ask_cap
+        if [ "$_cap" = 8.6 ] && pthfa_installed; then
+          export PTH_FA=1
+        elif [ "$_cap" = 8.6 ]; then
+          echo "resolve_config: PTH_FA defaults to 1 on $_pth_arm on compute capability 8.6, but the pth_flash_attn package is not in the venv, so the arm's own default runs (bash pthfa/install.sh to use it; PTH_FA=0 silences this)" >&2
+        fi
+      fi
+    fi
     FA2_FP8KV_SRC=explicit
     if [ -z "${FA2_FP8KV:-}" ]; then
       FA2_FP8KV_SRC=default
@@ -78,12 +124,9 @@ resolve_effective_config() {
           echo "resolve_config: FA2_FP8KV defaults to 0 with $_fa2_tier: the FA2 arm's LBNHC KV layout does not fit the OffloadingConnector, so this stays on int8 + Triton (set FA2_FP8KV=0 to silence this)" >&2
         else
           # The fa2/ build is sm_86 only and measured only on an RTX 3090, so the default is on only
-          # when the GPU the server gets is compute capability 8.6. nvidia-smi ignores
-          # CUDA_VISIBLE_DEVICES and orders GPUs differently from CUDA, so with no selection every GPU
-          # it lists must be 8.6.
-          local _fa2_cap
-          _fa2_cap=$(nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "${CUDA_VISIBLE_DEVICES%%,*}"} \
-            --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' \r' | sort -u)
+          # when the GPU the server gets is compute capability 8.6.
+          _ask_cap
+          local _fa2_cap=$_cap
           if [ "$_fa2_cap" = 8.6 ] && [ "${PTH_FA:-0}" = 1 ]; then
             FA2_FP8KV_SRC="PTH_FA=1 overrides the 8.6 default"
           elif [ "$_fa2_cap" = 8.6 ]; then
@@ -148,7 +191,7 @@ resolve_effective_config() {
         mtp/long) _pth_on=": target and MTP drafter" ;;
         dflash2/long) _pth_on=": target and DFlash2 drafter" ;;
       esac
-      echo "[effective-config] PTH_FA=1 (int8_per_token_head KV on the CUSTOM backend, pthfa/$_pth_on)"
+      echo "[effective-config] PTH_FA=1 (${PTH_FA_SRC:-explicit}; int8_per_token_head KV on the CUSTOM backend, pthfa/$_pth_on)"
     fi
     echo "[effective-config] MODEL=$_model PORT=$_port"
     echo "[effective-config] MAX_LEN=${MAX_LEN:-<profile default>} MAX_SEQS=${MAX_SEQS:-<profile default>}"
