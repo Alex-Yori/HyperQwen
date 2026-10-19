@@ -39,11 +39,12 @@
 #   not as the fast path. Numbers in gotcha 40.
 # FA2_FP8KV (default 1 on SPEC=dflash2 CTX=long on a compute capability 8.6 GPU): fp8 KV with the
 #   FA2 plugin (fa2/, bash fa2/install.sh) instead of int8 + Triton. FA2_FP8KV=0 restores int8 +
-#   Triton, and KV_OFFLOAD_GB or another GPU turns the default off. See the arm below.
+#   Triton, and KV_OFFLOAD_GB, PTH_FA=1 or another GPU turns the default off. See the arm below.
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/), 200k context with MTP, at roughly
 #   half the decode rate past 100k — see below and docs/long-context.md.
-# PTH_FA=1 (SPEC=mtp CTX=long only, default 0): int8 per-token-head KV read by the pth-flash-attn
-#   kernel (pthfa/) on the target and the MTP drafter, instead of fp8 on FlashInfer — see below.
+# PTH_FA=1 (SPEC=mtp CTX=long and SPEC=dflash2 CTX=long only, default 0): int8 per-token-head KV read
+#   by the pth-flash-attn kernel (pthfa/), on the target and the MTP drafter instead of fp8 on FlashInfer,
+#   or on the DFlash2 target instead of TRITON_ATTN (its drafter stays there) — see below.
 #
 # Fast variant: MODEL defaults to models/Qwen3.8-27B-W4A16-AutoRound-fast when it
 # exists (int4-GPTQ lm_head + MTP, own-output draft vocab; drafter/README.md), else
@@ -273,13 +274,54 @@ fi
 # cache: 128k TTFT 129 s against 250 s, N=1 decode at 128k 85-92 against 46 tok/s, MTP tokens per step
 # and GSM8K unchanged (docs/long-context.md has the table, the hardware and the launch line; gotcha 63 the
 # limits). Default 0: unset, the argv and the environment are those of the arm without it.
+# SPEC=dflash2 CTX=long: the arm's own int8_per_token_head cache, read by the kernel on the target only.
+# The DFlash2 drafter's five layers are sliding-window and non-causal, which the kernel does not serve
+# (gotcha 63), so its speculative config gets no attention_backend and stays the arm's own, byte for
+# byte: the drafter autoselects TRITON_ATTN, as it does without the knob. VLLM_SPEC_DECODE_ATTN stays as
+# the arm sets it; on this arm only the drafter's Triton impl reads it, and its split-KV verify gate
+# skips the drafter's windowed layers (patches/spec-decode-int8-kv.patch). Only the measured drafting
+# setup is accepted: the DFlash2 drafter (DRAFT_METHOD unset or dflash), DFLASH_TOKENS unset or 7,
+# LOOKUP unset or 1 and DYNAMIC_K unset; anything else on this arm is refused. Capped 2x RTX 3080 20 GB
+# at TP=2, vLLM 0.31.0, one sitting (2026-10-17/18), N=1 decode at 128k: 108.4 tok/s with PTH_FA=1 (this
+# branch's image), 81.5 on the FA2 fp8 default, 58.6 on TRITON_ATTN int8; ms per pass 29.0 / 36.8 / 55.0;
+# GSM8K 0.955 on all three; FA2 has the shorter cold 128k prefill (114.1 against 122.3 s) and the larger
+# KV pool (517,656 against 504,770 tokens) (docs/long-context.md).
+# On a compute capability 8.6 GPU this arm defaults to FA2_FP8KV=1 (fp8 KV on the FA2 plugin, above).
+# PTH_FA=1 overrides that default and refuses an explicit FA2_FP8KV=1; both happen in resolve_config.sh,
+# before the FA2 block above, so with PTH_FA=1 FA2_FP8KV is never 1 here.
 PTH_FA=${PTH_FA:-0}
 PTH_SPEC_BACKEND=
 if [ "$PTH_FA" = 1 ]; then
-  if [ "$SPEC" != mtp ] || [ "$CTX" != long ]; then
-    echo "PTH_FA=1 is a SPEC=mtp CTX=long setting (got SPEC=$SPEC CTX=$CTX); refusing rather than" >&2
-    echo "  booting an arm it was not measured on. Unset PTH_FA, or set SPEC=mtp CTX=long." >&2
-    exit 1
+  case "$SPEC/$CTX" in
+    mtp/long|dflash2/long) ;;
+    *)
+      echo "PTH_FA=1 is a SPEC=mtp CTX=long or SPEC=dflash2 CTX=long setting (got SPEC=$SPEC CTX=$CTX);" >&2
+      echo "  refusing rather than booting an arm it was not measured on. Unset PTH_FA, or set one of those." >&2
+      exit 1 ;;
+  esac
+  if [ "$SPEC" = dflash2 ]; then
+    if [ "${DRAFT_METHOD:-dflash}" != dflash ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with the DFlash2 drafter only; DRAFT_METHOD=$DRAFT_METHOD is a" >&2
+      echo "  different drafter, untested next to this backend. Unset DRAFT_METHOD, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ "${DFLASH_TOKENS:-7}" != 7 ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured at DFLASH_TOKENS=7 (an 8-token verify block); DFLASH_TOKENS=$DFLASH_TOKENS" >&2
+      echo "  changes the target's verify block (and above 7 makes its length adaptive), untested on this backend." >&2
+      echo "  Unset DFLASH_TOKENS, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ "${LOOKUP:-1}" != 1 ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with lookup drafting on; LOOKUP=$LOOKUP is untested on this" >&2
+      echo "  backend. Unset LOOKUP, or PTH_FA." >&2
+      exit 1
+    fi
+    if [ -n "${DYNAMIC_K:-}" ]; then
+      echo "PTH_FA=1 on SPEC=dflash2 is measured with a fixed verify block of 8 tokens; DYNAMIC_K=$DYNAMIC_K sets the" >&2
+      echo "  draft count per batch size, which changes the query length per batch, untested on this backend." >&2
+      echo "  Unset DYNAMIC_K, or PTH_FA." >&2
+      exit 1
+    fi
   fi
   case " ${EXTRA_ARGS:-} " in
     *" --attention-backend"*|*" --kv-cache-dtype"*|*" --speculative-config"*)
@@ -299,8 +341,15 @@ sys.exit(0 if s and os.path.isfile(os.path.join(s.submodule_search_locations[0],
     exit 1
   }
   ATTN_ARGS="--attention-backend CUSTOM --kv-cache-dtype int8_per_token_head"
-  PTH_SPEC_BACKEND=',"attention_backend":"CUSTOM"'
-  echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and MTP drafter" >&2
+  if [ "$SPEC" = mtp ]; then
+    PTH_SPEC_BACKEND=',"attention_backend":"CUSTOM"'
+    echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target and MTP drafter" >&2
+  else
+    echo "[start_qwen] PTH_FA=1: int8_per_token_head KV on the CUSTOM backend (pth-flash-attn), target only; the DFlash2" >&2
+    echo "  drafter is left to vLLM's autoselect (TRITON_ATTN): its sliding-window, non-causal layers are outside the kernel" >&2
+  fi
+  [ "${FA2_FP8KV_SRC:-}" = "PTH_FA=1 overrides the 8.6 default" ] \
+    && echo "[start_qwen] PTH_FA=1: FA2_FP8KV=0, PTH_FA=1 overrides the 8.6 default (fp8 KV on the FA2 plugin)" >&2
 elif [ "$PTH_FA" != 0 ]; then
   echo "PTH_FA=$PTH_FA: set it to 0 or 1" >&2
   exit 1

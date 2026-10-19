@@ -61,6 +61,9 @@ resolve_effective_config() {
     # (offloading_connector.py:225-228), and the CPU tier on it is untested, so a KV offload tier
     # turns the default off with a note and an explicit 1 into a refusal. So does a GPU that is not
     # compute capability 8.6 (or no answer from nvidia-smi); an explicit 1 there is the user's call.
+    # PTH_FA=1 (the int8 kernel, pthfa/) is the other dflash2 CTX=long backend: with it the 8.6 default
+    # is not applied (FA2_FP8KV stays 0, and the effective-config line says why), and an explicit
+    # FA2_FP8KV=1 alongside it is refused here, before the launcher probes either plugin.
     local _fa2_tier=
     if [ -n "${KV_OFFLOAD_GB:-}" ] && [ "$KV_OFFLOAD_GB" != 0 ]; then _fa2_tier="KV_OFFLOAD_GB=$KV_OFFLOAD_GB"
     else case " ${EXTRA_ARGS:-} " in
@@ -81,7 +84,9 @@ resolve_effective_config() {
           local _fa2_cap
           _fa2_cap=$(nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i "${CUDA_VISIBLE_DEVICES%%,*}"} \
             --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' \r' | sort -u)
-          if [ "$_fa2_cap" = 8.6 ]; then
+          if [ "$_fa2_cap" = 8.6 ] && [ "${PTH_FA:-0}" = 1 ]; then
+            FA2_FP8KV_SRC="PTH_FA=1 overrides the 8.6 default"
+          elif [ "$_fa2_cap" = 8.6 ]; then
             export FA2_FP8KV=1
           else
             _fa2_cap=$(printf %s "${_fa2_cap:-unknown}" | tr '\n' /)
@@ -94,6 +99,8 @@ resolve_effective_config() {
     if [ "${FA2_FP8KV:-0}" = 1 ]; then
       [ "$spec" = dflash2 ] && [ "$ctx" = long ] \
         || _refuse "FA2_FP8KV=1 runs only on SPEC=dflash2 CTX=long (got SPEC=$spec CTX=$ctx)"
+      [ "${PTH_FA:-0}" != 1 ] \
+        || _refuse "PTH_FA=1 and FA2_FP8KV=1 both pick the dflash2 backend (the int8 kernel against the FA2 fp8 port); unset FA2_FP8KV (PTH_FA=1 overrides its 8.6 default) or set PTH_FA=0"
       [ -z "$_fa2_tier" ] \
         || _refuse "FA2_FP8KV=1 with $_fa2_tier: the FA2 backend supports only the LBNHC KV layout and vLLM's OffloadingConnector needs LBHNC or BLHNC; the CPU tier is untested on it (FA2_FP8KV=0, or no KV offload tier)"
     fi
@@ -105,7 +112,7 @@ resolve_effective_config() {
     [ -z "${CTX:-}" ] || _warn "CTX=$CTX is set but batch mode ignores it (CTX is a single-user control)"
     [ -z "${SPEC:-}" ] || _warn "SPEC=$SPEC is set but batch mode ignores it (SPEC is a single-user control)"
     [ -z "${PTH_FA:-}" ] || [ "$PTH_FA" = 0 ] \
-      || _warn "PTH_FA=$PTH_FA is set but batch mode ignores it (PTH_FA is a single-user control, SPEC=mtp CTX=long)"
+      || _warn "PTH_FA=$PTH_FA is set but batch mode ignores it (PTH_FA is a single-user control, CTX=long with SPEC=mtp or dflash2)"
   fi
 
   # 2. EXTRA_ARGS shadow warnings. The launchers expand EXTRA_ARGS after their
@@ -136,7 +143,12 @@ resolve_effective_config() {
       && echo "[effective-config] CTX=$ctx SPEC=$spec FA2_FP8KV=${FA2_FP8KV:-0} (${FA2_FP8KV_SRC:-explicit})" \
       || echo "[effective-config] KV=$kv"
     if [ "$mode" = "single" ] && [ "${PTH_FA:-0}" = 1 ]; then
-      echo "[effective-config] PTH_FA=1 (int8_per_token_head KV on the CUSTOM backend, pthfa/)"
+      local _pth_on=
+      case "$spec/$ctx" in
+        mtp/long) _pth_on=": target and MTP drafter" ;;
+        dflash2/long) _pth_on=": target only, the DFlash2 drafter on TRITON_ATTN (autoselected)" ;;
+      esac
+      echo "[effective-config] PTH_FA=1 (int8_per_token_head KV on the CUSTOM backend, pthfa/$_pth_on)"
     fi
     echo "[effective-config] MODEL=$_model PORT=$_port"
     echo "[effective-config] MAX_LEN=${MAX_LEN:-<profile default>} MAX_SEQS=${MAX_SEQS:-<profile default>}"
