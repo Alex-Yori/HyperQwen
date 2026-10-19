@@ -22,6 +22,8 @@
 // - Alignment: q, out and the workspace need 16-B aligned base pointers and
 //   outer byte strides (16-B vector loads/stores); the four cache streams
 //   need 4-B alignment (the narrowest cp.async). EINVAL otherwise.
+// - window > 0 or causal == 0 (the windowed kernels) needs
+//   head_size 128 and the separate-stream loader; EINVAL otherwise.
 
 #pragma once
 

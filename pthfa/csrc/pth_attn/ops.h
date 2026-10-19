@@ -32,6 +32,9 @@ namespace pth_attn {
 // softmax_scale   scale applied to Q.K before the softmax.
 // ws_o            [S', T', Hq, D] float32 partials, S' >= S, T' >= T.
 // ws_lse          [S', T', Hq] float32 log2-sum-exp of each partial.
+// window          sliding window in tokens, 0 = none.
+// causal          bottom-right causal (true) or non-causal (false); window > 0
+//                 or !causal selects the windowed kernels (D = 128 only).
 void pth_flash_attn_fwd(
     torch::stable::Tensor& out, const torch::stable::Tensor& q,
     const torch::stable::Tensor& k_cache, const torch::stable::Tensor& v_cache,
@@ -40,7 +43,8 @@ void pth_flash_attn_fwd(
     const torch::stable::Tensor& seq_lens,
     const torch::stable::Tensor& query_start_loc, int64_t max_query_len,
     int64_t wm, int64_t num_splits, double softmax_scale,
-    torch::stable::Tensor& ws_o, torch::stable::Tensor& ws_lse);
+    torch::stable::Tensor& ws_o, torch::stable::Tensor& ws_lse, int64_t window,
+    bool causal);
 
 namespace detail {
 

@@ -21,9 +21,10 @@
 //      a non-zero index, and the row bytes (plan §3.4 step 1).
 //   4. Which rows and tokens a CTA owns. Row tile -> request and query tokens
 //      (BQ packing), row -> (query token, query head) (token-major, ADR 0013),
-//      the bottom-right causal limit of every row, the CTA's KV range, the
-//      tile-balanced split partition (equal to planner.split_tile_range), and
-//      which KV tiles need a mask at all.
+//      the bottom-right causal limit of every row (or, for the windowed
+//      kernels, its visible window [lo, hi]), the CTA's KV range,
+//      the tile-balanced split partition (equal to planner.split_tile_range),
+//      and which KV tiles need a mask at all.
 //
 // Decisions and evidence: ADR 0015 (address math), ADR 0013 (GQA packing and
 // BQ). Teaching text: docs/walkthrough/04-gqa-packing.md and chapter 01 §5.
@@ -413,6 +414,91 @@ PTH_HD void split_tile_range(int32_t split, int32_t num_splits,
 PTH_HD bool tile_needs_mask(int32_t tile, int32_t tile_tokens,
                             int32_t min_limit) {
   return static_cast<int64_t>(tile) * tile_tokens + tile_tokens - 1 > min_limit;
+}
+
+// --------------------------------------------------------- window geometry
+// The windowed kernels (sliding window and/or non-causal; the
+// kWindow instantiations of attn_kernel.cuh) give row token `tok`, at
+// absolute position p = kv_limit(q_len, seq_len, tok), the inclusive visible
+// range [lo, hi]:
+//   lo = window > 0 ? max(0, p - window + 1) : 0
+//   hi = causal ? p : (window > 0 ? min(seq_len - 1, p + window - 1)
+//                                 : seq_len - 1)
+// window = 0 means no window. Causal with window 0 is the causal geometry
+// above (lo = 0, hi = kv_limit). This is vLLM's Triton mask with
+// window_size = (window - 1, 0): non-causal k < seq_len and |p - k| < window,
+// causal 0 <= p - k < window. Both bounds are non-decreasing in tok, so a row
+// tile's extremes come from its first and last token. No intermediate value
+// overflows int32 (each comparison is a difference of in-range positions).
+PTH_HD int32_t kv_window_lo(int32_t q_len, int32_t seq_len, int32_t tok,
+                            int32_t window) {
+  const int32_t p = kv_limit(q_len, seq_len, tok);
+  return window > 0 && p >= window ? p - window + 1 : 0;
+}
+
+PTH_HD int32_t kv_window_hi(int32_t q_len, int32_t seq_len, int32_t tok,
+                            int32_t window, bool causal) {
+  const int32_t p = kv_limit(q_len, seq_len, tok);
+  if (causal) return p;
+  return window > 0 && seq_len - 1 - p >= window ? p + window - 1 : seq_len - 1;
+}
+
+// First KV position any row of the tile sees: lo of its first token. The
+// loader zero-fills the tokens of the first tile below it.
+PTH_HD int32_t kv_window_range_begin(const RowTile& t, int32_t window) {
+  return kv_window_lo(t.q_len, t.seq_len, t.tok_begin, window);
+}
+
+// One past the last KV position any row of the tile sees: hi of its last
+// token, + 1.
+PTH_HD int32_t kv_window_range_end(const RowTile& t, int32_t window,
+                                   bool causal) {
+  return kv_window_hi(t.q_len, t.seq_len, t.tok_begin + t.num_tok - 1, window,
+                      causal) +
+         1;
+}
+
+// The largest lo of the tile (its last token): positions at or above it,
+// and at or below kv_window_min_hi, are visible to every real row.
+PTH_HD int32_t kv_window_max_lo(const RowTile& t, int32_t window) {
+  return kv_window_lo(t.q_len, t.seq_len, t.tok_begin + t.num_tok - 1, window);
+}
+
+// The smallest hi of the tile (its first token).
+PTH_HD int32_t kv_window_min_hi(const RowTile& t, int32_t window, bool causal) {
+  return kv_window_hi(t.q_len, t.seq_len, t.tok_begin, window, causal);
+}
+
+// The KV tile holding range_begin: the windowed CTA's tiles start there
+// (rounded down, so the first tile may start below the range; the loader
+// zero-fills and the mask hides those tokens).
+PTH_HD int32_t kv_first_tile(int32_t range_begin, int32_t tile_tokens) {
+  return range_begin / tile_tokens;
+}
+
+// Tiles [begin, end) of split `split` for a windowed CTA: split_tile_range
+// over the tiles from kv_first_tile(range_begin) to ceil(range_end / N),
+// offset by the first tile. With range_begin = 0 it is the causal partition.
+PTH_HD void window_split_tile_range(int32_t split, int32_t num_splits,
+                                    int32_t range_begin, int32_t range_end,
+                                    int32_t tile_tokens, int32_t& begin,
+                                    int32_t& end) {
+  const int32_t first = kv_first_tile(range_begin, tile_tokens);
+  split_tile_range(split, num_splits,
+                   num_kv_tiles(range_end, tile_tokens) - first, begin, end);
+  begin += first;
+  end += first;
+}
+
+// True iff some (row, token) pair of KV tile `tile` lies outside its row's
+// window. Exact by the argument of tile_needs_mask, once per side: the tile's
+// first token against the last row (largest lo) and its last token against
+// the first row (smallest hi) are the worst pairs. Covers the zero-filled
+// tokens below the range begin and past the range end.
+PTH_HD bool tile_needs_window_mask(int32_t tile, int32_t tile_tokens,
+                                   int32_t max_lo, int32_t min_hi) {
+  const int64_t first = static_cast<int64_t>(tile) * tile_tokens;
+  return first < max_lo || first + tile_tokens - 1 > min_hi;
 }
 
 }  // namespace pth_attn

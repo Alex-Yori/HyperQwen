@@ -51,6 +51,19 @@ Both::
     q_tiles_upper = T // bq + num_reqs  (>= sum_i ceil(q_i / bq); each CTA
                                          binary-searches query_start_loc)
 
+Sliding window W > 0::
+
+    S = min(S, ceil((W + q_max - 2) / 64) + 1)
+
+A row tile of at most q_max tokens sees at most n = W + q_max - 1 keys,
+causal or not (its queries lie within the last q_max positions of the
+request). n consecutive keys touch at most ceil((n - 1) / 64) + 1 KV tiles
+(n - 1 key steps after the first key, at the worst alignment), so the cap is
+the most tiles one row tile can have: at the cap no split is empty at the
+worst alignment, and every split it removes would have been empty
+(lse = -inf, an extra combine input). W is a layer constant, not a length, so
+the plan stays a pure function of the descriptor.
+
 Workspace in token-splits (ADR 0017)::
 
     S_alone = ceil(C_target / Hkv)
@@ -76,6 +89,11 @@ MAX_ROWS_PER_CTA = MMA_ROWS_PER_WARP * WM_CHOICES[-1]
 # A GPU session checks these against the occupancy API (plan §3.7), not here.
 CTAS_PER_SM = {64: 3, 128: 2, 256: 1}
 SUPPORTED_HEAD_SIZES = tuple(sorted(CTAS_PER_SM))
+# Head size with a windowed (sliding-window / non-causal) kernel variant; the
+# op refuses window > 0 or causal = False at any other D.
+WINDOWED_HEAD_SIZES = (128,)
+# KV tokens per tile: kLoadTileTokens in csrc/pth_attn/tile_traits.cuh.
+KV_TILE_TOKENS = 64
 # O partials and the per-row log2-LSE are fp32 (C25, ADR 0016).
 PARTIAL_BYTES_PER_ELEMENT = 4
 
@@ -90,6 +108,7 @@ DESCRIPTOR_FIELDS = (
     "num_sms",
     "is_prefill",
     "ws_token_splits",
+    "window",
 )
 
 
@@ -232,6 +251,7 @@ def plan_launch(
     num_sms: int,
     is_prefill: bool,
     ws_token_splits: int,
+    window: int = 0,
 ) -> LaunchPlan:
     """Plan one launch from the padded batch descriptor of its slice.
 
@@ -250,6 +270,9 @@ def plan_launch(
         num_sms: SM count of the device (an input; never queried here).
         is_prefill: True for the prefill launch, False for the decode-like one.
         ws_token_splits: W_ts reserved at load (``workspace_token_splits``).
+        window: the layer's sliding window W in tokens, 0 for none (the op's
+            ``window``). A layer constant, not a length: W > 0 caps S at the
+            KV tiles one row tile can see (module docstring).
 
     Returns:
         The frozen LaunchPlan for this launch.
@@ -262,6 +285,7 @@ def plan_launch(
     d = _require_head_size(D)
     sms = _require_int("num_sms", num_sms, 1)
     w_ts = _require_int("ws_token_splits", ws_token_splits, 0)
+    w = _require_int("window", window, 0)
     if not isinstance(is_prefill, bool):
         raise TypeError(f"is_prefill must be a bool, got {type(is_prefill).__name__}")
     if q_max > t:
@@ -294,6 +318,10 @@ def plan_launch(
     s_want = _ceil_div(c_target(D=d, num_sms=sms), hkv * tiles_for_split)
     s_cap = w_ts // t  # S * T must fit the workspace reserved at load
     num_splits = max(1, min(s_want, s_cap))
+    if w > 0:
+        # The most KV tiles one row tile can touch at any alignment: its
+        # W + q_max - 1 keys span ceil((W + q_max - 2) / 64) + 1 tiles at worst.
+        num_splits = min(num_splits, _ceil_div(w + q_max - 2, KV_TILE_TOKENS) + 1)
 
     return LaunchPlan(
         wm=wm,

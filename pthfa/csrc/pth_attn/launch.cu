@@ -169,7 +169,7 @@ void check_metadata(const Tensor& out, const Tensor& q, const Tensor& k_cache,
                     const Tensor& seq_lens, const Tensor& query_start_loc,
                     int64_t max_query_len, int64_t wm, int64_t num_splits,
                     double softmax_scale, const Tensor& ws_o,
-                    const Tensor& ws_lse) {
+                    const Tensor& ws_lse, int64_t window, bool causal) {
   // q and out: [T, Hq, D], 16-bit float, rows of D contiguous.
   check_dim(q, 3, "q");
   STD_TORCH_CHECK(q.scalar_type() == ScalarType::BFloat16 ||
@@ -262,6 +262,13 @@ void check_metadata(const Tensor& out, const Tensor& q, const Tensor& k_cache,
                   "pth_flash_attn_fwd: softmax_scale must be finite and > 0, "
                   "got ",
                   softmax_scale);
+  STD_TORCH_CHECK(window >= 0, "pth_flash_attn_fwd: window must be >= 0, got ",
+                  window);
+  // The windowed kernels exist at D = 128 only.
+  STD_TORCH_CHECK(!((window > 0 || !causal) && head_size != kHeadSize128),
+                  "pth_flash_attn_fwd: sliding-window and non-causal attention "
+                  "need head size D = 128, got ",
+                  head_size);
 
   // Devices: everything the kernel reads or writes lives with q.
   check_same_device(out, q, "out");
@@ -426,7 +433,8 @@ void launch_library(Tensor& out, const Tensor& q, const Tensor& k_cache,
                     const Tensor& v_scale, const Tensor& block_table,
                     const Tensor& seq_lens, const Tensor& query_start_loc,
                     int64_t max_query_len, int64_t wm, int64_t num_splits,
-                    double softmax_scale, Tensor& ws_o, Tensor& ws_lse) {
+                    double softmax_scale, Tensor& ws_o, Tensor& ws_lse,
+                    int64_t window, bool causal) {
   const int64_t num_kv_heads = k_cache.size(2);
   const int64_t group = q.size(1) / num_kv_heads;
   const int32_t bq = tile_tokens(wm, group, max_query_len);
@@ -460,6 +468,9 @@ void launch_library(Tensor& out, const Tensor& q, const Tensor& k_cache,
   a.num_q_tiles = 0;  // the library's T / bq + num_reqs (planner q_tiles_upper)
   a.num_splits = static_cast<int32_t>(num_splits);
   a.softmax_scale = static_cast<float>(softmax_scale);
+  // A window wider than any int32 sequence is the same as INT32_MAX.
+  a.window = window > INT32_MAX ? INT32_MAX : static_cast<int32_t>(window);
+  a.causal = causal ? 1 : 0;
   if (num_splits > 1) {
     a.ws_o = static_cast<float*>(ws_o.data_ptr());
     a.ws_o_stride_split = byte_stride(ws_o, 0);
@@ -514,10 +525,11 @@ void pth_flash_attn_fwd(Tensor& out, const Tensor& q, const Tensor& k_cache,
                         const Tensor& v_scale, const Tensor& block_table,
                         const Tensor& seq_lens, const Tensor& query_start_loc,
                         int64_t max_query_len, int64_t wm, int64_t num_splits,
-                        double softmax_scale, Tensor& ws_o, Tensor& ws_lse) {
+                        double softmax_scale, Tensor& ws_o, Tensor& ws_lse,
+                        int64_t window, bool causal) {
   check_metadata(out, q, k_cache, v_cache, k_scale, v_scale, block_table,
                  seq_lens, query_start_loc, max_query_len, wm, num_splits,
-                 softmax_scale, ws_o, ws_lse);
+                 softmax_scale, ws_o, ws_lse, window, causal);
   check_addresses(out, q, k_cache, v_cache, k_scale, v_scale, block_table,
                   seq_lens, query_start_loc, num_splits, ws_o, ws_lse);
   // The same function is registered for the CPU key (torch_bindings.cpp) so
@@ -536,7 +548,7 @@ void pth_flash_attn_fwd(Tensor& out, const Tensor& q, const Tensor& k_cache,
   }
   launch_library(out, q, k_cache, v_cache, k_scale, v_scale, block_table,
                  seq_lens, query_start_loc, max_query_len, wm, num_splits,
-                 softmax_scale, ws_o, ws_lse);
+                 softmax_scale, ws_o, ws_lse, window, causal);
 }
 
 }  // namespace pth_attn

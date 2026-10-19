@@ -1,7 +1,7 @@
 # Sourced by pthfa/install.sh and pthfa/check_vendor.sh. KEY=value lines only.
 # PTH_COMMIT is the commit of the pth-flash-attn project this directory was vendored from; it is a commit id only (no
 # repository URL is recorded: nothing here fetches it, and --source takes a local checkout that has the commit).
-PTH_COMMIT=ab6bc1cb3021d6cd71258fd809d6311d24aa3dca
+PTH_COMMIT=a31d8ab22d734c87f2c2303837412d70d60560c1
 # What is vendored from PTH_COMMIT, and how (pthfa/check_vendor.sh --source re-does it and diffs):
 #   csrc/ and python/  the output of `tools/export_upstream.py --out` (the shipped subset, test hooks
 #                      stripped; tools/prove_export_sass.sh proves it compiles to the same SASS)

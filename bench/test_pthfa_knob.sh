@@ -1,8 +1,8 @@
 #!/bin/bash
 # CPU test for PTH_FA (single-user/start_qwen.sh, resolve_config.sh): unset, 0 and empty give the same argv,
 # VLLM_* environment and stderr on every single-user arm; PTH_FA=1 on SPEC=mtp CTX=long puts the target AND the
-# MTP drafter on the CUSTOM backend with an int8_per_token_head cache, and on SPEC=dflash2 CTX=long the target
-# only, with the arm's speculative config byte for byte (the DFlash2 drafter autoselects TRITON_ATTN); neither
+# MTP drafter on the CUSTOM backend with an int8_per_token_head cache, and on SPEC=dflash2 CTX=long the target AND
+# the DFlash2 drafter (the arm's speculative config plus "attention_backend":"CUSTOM", no kv_cache_dtype); neither
 # changes anything else in the argv or the VLLM_* environment; every other arm, a conflicting EXTRA_ARGS, a KV
 # connector, a missing install, a value other than 0/1, FA2_FP8KV=1 alongside it and, on dflash2, a drafting setup
 # other than the measured one (DRAFT_METHOD, DFLASH_TOKENS, LOOKUP, DYNAMIC_K) are refused, each with its own
@@ -18,9 +18,11 @@
 #   PTHFA_BASE_TREE=<checkout without pthfa> bash bench/test_pthfa_knob.sh
 #       also compares every single-user and batch arm with PTH_FA unset against that tree's launchers, argv,
 #       VLLM_* environment and stderr, byte for byte (the negative control against the tree this branch is cut from)
-#   PTHFA_PARENT_TREE=<checkout with the mtp-only PTH_FA knob> bash bench/test_pthfa_knob.sh
+#   PTHFA_PARENT_TREE=<checkout with an earlier PTH_FA knob> bash bench/test_pthfa_knob.sh
 #       also compares SPEC=mtp CTX=long PTH_FA=1 against that tree's launcher: argv and VLLM_* environment byte for
-#       byte, stderr byte for byte except the [effective-config] PTH_FA=1 line, whose wording names the models here
+#       byte, stderr byte for byte except the [effective-config] PTH_FA=1 line, whose wording names the models here;
+#       and, if that tree accepts SPEC=dflash2 CTX=long PTH_FA=1 (target only), the dflash2 argv and VLLM_*
+#       environment against it: the same but for ,"attention_backend":"CUSTOM" at the end of the speculative config
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; REPO="$(dirname "$HERE")"
 FAILS=0
@@ -83,7 +85,7 @@ grep -q '^\[effective-config\] PTH_FA=1 .*target and MTP drafter' "$T/on.err" &&
 run "$T/new" single-user/start_qwen.sh SPEC=mtp CTX=long PTH_FA=1 EXTRA_ARGS="--tensor-parallel-size 2 --disable-custom-all-reduce" > "$T/tp"
 check "0 2" "$(rc) $(after --tensor-parallel-size < "$T/tp")" "TP=2 through EXTRA_ARGS boots"
 
-echo "== PTH_FA=1, SPEC=dflash2 CTX=long: the target only, the DFlash2 drafter's speculative config untouched"
+echo "== PTH_FA=1, SPEC=dflash2 CTX=long: the target and the DFlash2 drafter"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long > "$T/doff"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 > "$T/don"; cp "$T/err" "$T/don.err"
 check 0 "$(rc)" "boots"
@@ -91,19 +93,26 @@ check CUSTOM "$(after --attention-backend < "$T/don")" "--attention-backend CUST
 check int8_per_token_head "$(after --kv-cache-dtype < "$T/don")" "--kv-cache-dtype int8_per_token_head, once"
 check "TRITON_ATTN int8_per_token_head" "$(after --attention-backend < "$T/doff") $(after --kv-cache-dtype < "$T/doff")" \
   "(control: the arm without it runs TRITON_ATTN on the same cache dtype)"
+dspec=$(after --speculative-config < "$T/don")
+check "dflash CUSTOM" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d["method"], d.get("attention_backend"))' "$dspec" 2>&1)" \
+  "the drafter's backend is in the speculative config"
+check "None" "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("kv_cache_dtype"))' "$dspec" 2>&1)" \
+  "no kv_cache_dtype in it: the drafter's cache keeps the target's int8_per_token_head"
 dspec_off=$(after --speculative-config < "$T/doff")
-check "$dspec_off" "$(after --speculative-config < "$T/don")" \
-  "the speculative config is byte-equal to the arm's own (no attention_backend: the drafter autoselects)"
+check "$dspec_off" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d.pop("attention_backend"); print(json.dumps(d, separators=(",", ":")))' "$dspec")" \
+  "the speculative config is otherwise the arm's own"
+check "${dspec_off%\}}"',"attention_backend":"CUSTOM"}' "$dspec" \
+  "the speculative config is the arm's own with ,\"attention_backend\":\"CUSTOM\" appended, byte for byte"
 check "dflash None" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d["method"], d.get("attention_backend"))' "$dspec_off" 2>&1)" \
   "(control: the arm's own speculative config names no drafter backend)"
 check "1 1" "$(sed -n 's/^VLLM_SPEC_DECODE_ATTN=//p' < "$T/don") $(sed -n 's/^VLLM_SPEC_DECODE_ATTN=//p' < "$T/doff")" \
   "VLLM_SPEC_DECODE_ATTN stays the arm's 1"
 check same "$(cmp -s <(strip < "$T/don") <(strip < "$T/doff") && echo same || echo differs)" \
   "every other argument and VLLM_* variable unchanged (compilation config, graph sizes, max len, seqs)"
-grep -q '^\[effective-config\] PTH_FA=1 .*target only, the DFlash2 drafter on TRITON_ATTN (autoselected)' "$T/don.err" \
-  && check 1 1 "the effective config names it, target only" || check 1 0 "the effective config names it, target only"
-grep -q '^\[start_qwen\] PTH_FA=1: .*target only; the DFlash2' "$T/don.err" \
-  && check 1 1 "the launcher says the drafter is left to autoselect" || check 1 0 "the launcher says the drafter is left to autoselect"
+grep -q '^\[effective-config\] PTH_FA=1 .*: target and DFlash2 drafter)$' "$T/don.err" \
+  && check 1 1 "the effective config names it, target and drafter" || check 1 0 "the effective config names it, target and drafter"
+grep -q '^\[start_qwen\] PTH_FA=1: .*target and DFlash2$' "$T/don.err" && grep -q '^  drafter on CUSTOM: ' "$T/don.err" \
+  && check 1 1 "the launcher says target and drafter on CUSTOM" || check 1 0 "the launcher says target and drafter on CUSTOM"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 EXTRA_ARGS="--tensor-parallel-size 2 --disable-custom-all-reduce" > "$T/tp"
 check "0 2" "$(rc) $(after --tensor-parallel-size < "$T/tp")" "TP=2 through EXTRA_ARGS boots"
 run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 DRAFT_METHOD=dflash DFLASH_TOKENS=7 LOOKUP=1 FA2_FP8KV=0 DYNAMIC_K= > "$T/dexp"
@@ -237,5 +246,18 @@ if [ -n "${PTHFA_PARENT_TREE:-}" ]; then
       <(grep -v '^\[effective-config\] PTH_FA=1 ' "$T/x.err") <(grep -v '^\[effective-config\] PTH_FA=1 ' "$T/y.err") \
       && echo same || echo differs)" "single $arm"
   done
+  run "$T/parent" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 > "$T/x"; rx=$(rc)
+  if [ "$rx" = 0 ]; then
+    run "$T/new" single-user/start_qwen.sh SPEC=dflash2 CTX=long PTH_FA=1 > "$T/y"; ry=$(rc)
+    sed -i "s|$T/parent|TREE|g" "$T/x"; sed -i "s|$T/new|TREE|g" "$T/y"
+    px=$(after --speculative-config < "$T/x"); py=$(after --speculative-config < "$T/y")
+    check "0 same" "$ry $(cmp -s <(strip < "$T/x") <(strip < "$T/y") && echo same || echo differs)" \
+      "dflash2: every other argument and VLLM_* variable as the parent's"
+    check "${px%\}}"',"attention_backend":"CUSTOM"}' "$py" "dflash2: the speculative config is the parent's plus the drafter's backend"
+    check "$(after --attention-backend < "$T/x") $(after --kv-cache-dtype < "$T/x")" \
+      "$(after --attention-backend < "$T/y") $(after --kv-cache-dtype < "$T/y")" "dflash2: the target's flags as the parent's"
+  else
+    echo "  SKIP  dflash2 against the parent: it refuses SPEC=dflash2 CTX=long PTH_FA=1 (an mtp-only knob)"
+  fi
 fi
 echo; [ $FAILS = 0 ] && echo "all checks passed" || { echo "$FAILS checks FAILED"; exit 1; }

@@ -2,8 +2,8 @@
 
 `pthfa/` is the source of pth-flash-attn (Apache-2.0) at one pinned commit (`pthfa/PIN`, a commit id): a CUDA op library that reads vLLM's `int8_per_token_head` KV cache directly (no dequantize
 pass) on sm_80/86/89, and a `vllm.general_plugins` entry point that registers it as the backend `CUSTOM`.
-`PTH_FA=1` (single-user, `SPEC=mtp CTX=long` or `SPEC=dflash2 CTX=long`) selects it for the target, and for
-the MTP drafter on mtp (the DFlash2 drafter stays on `TRITON_ATTN`); nothing else
+`PTH_FA=1` (single-user, `SPEC=mtp CTX=long` or `SPEC=dflash2 CTX=long`) selects it for the target and
+the drafter (the MTP layer, or the DFlash2 drafter's sliding-window, non-causal layers); nothing else
 does. It is a separate extension, not a patch to vLLM, which is why it lives here and not in `patches/`:
 no vLLM file changes, and `patches/check_vllm_series.sh` is untouched by it.
 
@@ -39,16 +39,18 @@ says so. `tests/gate_test.py` checks each of these.
 ## Limits
 
 sm_80, sm_86 and sm_89 only; head sizes 64, 128 and 256; `--kv-cache-dtype int8_per_token_head` only;
-causal decoder self-attention without sliding window, ALiBi, attention sinks or logits soft cap; no DCP/PCP.
-An explicit selection outside these fails at model load with the reason (`docs/gotchas.md`, item 63). The
-library reads no environment variables.
+decoder self-attention, causal at every head size, sliding-window and non-causal at head size 128 only (the
+DFlash2 drafter's layers); no ALiBi, attention sinks, logits soft cap, bidirectional multimodal prefix or
+R-SWA; no DCP/PCP. An explicit selection outside these fails at backend selection or model load with the
+reason (`docs/gotchas.md`, item 63). The library reads no environment variables.
 
 ## Tests
 
 - `pthfa/tests/gate_test.py` (CPU): the items above, against the venv's vLLM.
 - `bench/test_pthfa_knob.sh` (CPU): `PTH_FA` in the launchers, against a stub `vllm`.
-- `bench/test_pthfa_attn.py` (GPU): the op against an fp32 reference on the cache it reads, including a pool
-  past block id 2,383 (#86/#109) and CUDA-graph replay; `SKIP(by design)` off sm_8x or without the package.
+- `bench/test_pthfa_attn.py` (GPU): the op against an fp64 reference on the cache it reads, including a pool
+  past block id 2,383 (#86/#109), CUDA-graph replay and the DFlash2 drafter's windowed, non-causal shapes;
+  `SKIP(by design)` off sm_8x or without the package.
 
 ## Re-vendoring
 
