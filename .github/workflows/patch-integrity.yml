@@ -53,6 +53,15 @@ jobs:
         run: bash bench/test_pthfa_knob.sh
       - name: Check pthfa/install.sh builds with an nvcc of torch's CUDA major and checks with a cuobjdump not older
         run: bash bench/test_pthfa_install_toolchain.sh
+      - name: Rerun the launcher tests as a compute capability 8.6 host (stub nvidia-smi), where FA2_FP8KV and PTH_FA can default on
+        run: |
+          mkdir -p "$RUNNER_TEMP/cc86"
+          printf '#!/bin/sh\ncase "$*" in *compute_cap*) echo 8.6 ;; *) exit 9 ;; esac\n' > "$RUNNER_TEMP/cc86/nvidia-smi"
+          chmod +x "$RUNNER_TEMP/cc86/nvidia-smi"
+          export PATH="$RUNNER_TEMP/cc86:$PATH"
+          for t in no_key_bind prefix_cache_knob kv_offload_knob dynamic_k_knob tp_size bool_knobs resident_print fa2_fp8kv_knob pthfa_knob; do
+            bash "bench/test_$t.sh"
+          done
 
   kvarn-torch-gate:
     runs-on: ubuntu-latest
