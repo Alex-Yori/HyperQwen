@@ -5,7 +5,8 @@ Kind: feature
 What: use a row-split bf16 SiLU*up kernel up to 64 query tokens and pass strided
   q/k/v views through the GDN speculative recurrence instead of materialising
   reshape copies. Both keep the arithmetic and output dtype unchanged; fp16
-  uses vLLM's stock activation op.
+  uses vLLM's stock activation op. Both runtime switches are registered in
+  `envs.py`, so they participate in the torch.compile cache key.
 Upstream: ported from TheRealBluesun/HyperQwen-3090ti, patches 09 and 10
   (1199731 and a332c5e), adapted to the vLLM 0.31 tree after the HyperQwen
   series. Their RTX 3090 measurements were 24.13 -> 23.34 ms/step for the
@@ -14,19 +15,49 @@ Cut-against: 0.31.0 with patches/series applied through qwen3_5-embed-uva.
 Retires-when: vLLM stops launching one CTA per token for small SiLU batches,
   or the GDN spec path stops copying q/k/v before the recurrence.
 
---- exported from 24bb68b (qwen3_5-small-batch-decode); regenerate with scripts/export-patch.sh, do not edit ---
+--- exported from 02ee1e9 (qwen3_5-small-batch-decode); regenerate with scripts/export-patch.sh, do not edit ---
 
+diff --git a/envs.py b/envs.py
+index 27adbb0..4b5026a 100644
+--- a/envs.py
++++ b/envs.py
+@@ -207,6 +207,9 @@
+     # torch.compile cache key; VLLM_MARLIN_TUNE changes the Marlin workspace shape)
+     VLLM_MARLIN_TUNE: bool = False
+     VLLM_MARLIN_TUNE_DIR: str = ""
++    # qwen3_5-small-batch-decode: both launch paths also change the compile key
++    VLLM_QWEN27_SMALL_SILU: bool = True
++    VLLM_QWEN27_STRIDED_QKV: bool = True
+     VLLM_DRAFT_TOPK_TOPP: bool = True
+     VLLM_PREFILL_ATTN: str = ""
+     VLLM_DFLASH2_LOOKUP: bool = False
+@@ -1635,6 +1638,8 @@
+     # syv patch: single-user speed knobs
+     "VLLM_MARLIN_TUNE": lambda: os.environ.get("VLLM_MARLIN_TUNE", "0") == "1",
+     "VLLM_MARLIN_TUNE_DIR": lambda: os.environ.get("VLLM_MARLIN_TUNE_DIR", ""),
++    "VLLM_QWEN27_SMALL_SILU": lambda: os.environ.get("VLLM_QWEN27_SMALL_SILU", "1") == "1",
++    "VLLM_QWEN27_STRIDED_QKV": lambda: os.environ.get("VLLM_QWEN27_STRIDED_QKV", "1") == "1",
+     "VLLM_DRAFT_TOPK_TOPP": lambda: os.environ.get("VLLM_DRAFT_TOPK_TOPP", "1") == "1",
+     # int8 (or fp16 scaffold) Triton prefill attention for hd256; "" keeps FA2
+     "VLLM_PREFILL_ATTN": lambda: os.environ.get("VLLM_PREFILL_ATTN", ""),
 diff --git a/model_executor/layers/activation.py b/model_executor/layers/activation.py
-index 808d6e7..467923e 100644
+index 808d6e7..b605cde 100644
 --- a/model_executor/layers/activation.py
 +++ b/model_executor/layers/activation.py
-@@ -18,6 +18,13 @@
+@@ -8,7 +8,7 @@
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+-from vllm import ir
++from vllm import envs, ir
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import CustomOp
+ from vllm.platforms import CpuArchEnum, current_platform
+@@ -18,6 +18,11 @@
  logger = init_logger(__name__)
  
  
-+import os as _os
-+
-+_QWEN27_SMALL_SILU = _os.environ.get("VLLM_QWEN27_SMALL_SILU", "1") == "1"
++_QWEN27_SMALL_SILU = envs.VLLM_QWEN27_SMALL_SILU
 +if _QWEN27_SMALL_SILU:
 +    import vllm.model_executor.layers.qwen27_small_ops  # noqa: F401
 +
@@ -34,7 +65,7 @@ index 808d6e7..467923e 100644
  @triton.jit
  def _swiglustep_and_mul_kernel(
      o_ptr,
-@@ -147,6 +154,9 @@
+@@ -147,6 +152,9 @@
          d = x.shape[-1] // 2
          output_shape = x.shape[:-1] + (d,)
          out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -45,14 +76,14 @@ index 808d6e7..467923e 100644
          return out
  
 diff --git a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
-index 9d5bcc8..5c9fcc0 100644
+index 9d5bcc8..8a5e959 100644
 --- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 +++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
 @@ -87,6 +87,7 @@
  logger = init_logger(__name__)
  
  MAX_FUSED_GDN_MTP_TOKENS = 8
-+_QWEN27_STRIDED_QKV = __import__('os').environ.get('VLLM_QWEN27_STRIDED_QKV', '1') == '1'
++_QWEN27_STRIDED_QKV = envs.VLLM_QWEN27_STRIDED_QKV
  FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
  
  
@@ -75,10 +106,10 @@ index 9d5bcc8..5c9fcc0 100644
          split_non_spec = (
 diff --git a/model_executor/layers/qwen27_small_ops.py b/model_executor/layers/qwen27_small_ops.py
 new file mode 100644
-index 0000000..aee42fe
+index 0000000..40abd07
 --- /dev/null
 +++ b/model_executor/layers/qwen27_small_ops.py
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,62 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Small-batch replacements for launch-shaped decode kernels.
 +
@@ -131,6 +162,14 @@ index 0000000..aee42fe
 +
 +def _silu_and_mul_fake(out: torch.Tensor, x: torch.Tensor) -> None:
 +    return
++
++
++direct_register_custom_op(
++    op_name="qwen27_silu_and_mul",
++    op_func=_silu_and_mul_impl,
++    mutates_args=["out"],
++    fake_impl=_silu_and_mul_fake,
++)
 +
 +
 diff --git a/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py b/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
