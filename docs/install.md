@@ -15,6 +15,11 @@ manual venv path is for hacking on the stack, or running it bare-metal.
 > with a full RTX 3090 reproduction of the benchmark tables in
 > [docs/reproductions/native-3090.md](reproductions/native-3090.md).
 
+Volta (V100, sm70) and older cards cannot run this stack at all: the CUDA 13.0 build of torch 2.13
+that vLLM 0.31 pins carries kernels for sm_75 and newer only (`torch.cuda.get_arch_list()`), CUDA 13
+dropped Volta, and vLLM's Marlin W4A16 kernel needs compute capability 7.5 or newer
+([#349](https://github.com/syv-ai/HyperQwen/issues/349)). Turing (sm75) is untested.
+
 You need: a 24 GB Ampere or newer NVIDIA card, a recent driver, Python 3.12,
 ~40 GB disk — and if the host has less than ~16 GB of free RAM, load the
 weights with the streamer instead of the stock loader (gotcha 45: the stock
