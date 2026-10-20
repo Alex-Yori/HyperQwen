@@ -31,6 +31,8 @@ jobs:
         run: python bench/test_harness.py
       - name: Check conc_ladder --salt repeats its prompts and reports a prefix-cache hit without a GPU
         run: python bench/test_conc_ladder_salt.py
+      - name: Check labd_bench's TTFT and decode rate survive a wall clock that steps back, without a GPU
+        run: python bench/test_labd_bench_clock.py
       - name: Check a launcher with no API key binds 127.0.0.1
         run: bash bench/test_no_key_bind.sh
       - name: Check PREFIX_CACHE sets the engine's prefix caching (unset/1 on, 0 off) and its safeguards follow
