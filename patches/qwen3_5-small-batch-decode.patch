@@ -1,0 +1,216 @@
+# Small-batch decode launch reductions for Qwen3.5/MTP on sm86.
+#
+
+Kind: feature
+What: use a row-split bf16 SiLU*up kernel up to 64 query tokens and pass strided
+  q/k/v views through the GDN speculative recurrence instead of materialising
+  reshape copies. Both keep the arithmetic and output dtype unchanged; fp16
+  uses vLLM's stock activation op.
+Upstream: ported from TheRealBluesun/HyperQwen-3090ti, patches 09 and 10
+  (1199731 and a332c5e), adapted to the vLLM 0.31 tree after the HyperQwen
+  series. Their RTX 3090 measurements were 24.13 -> 23.34 ms/step for the
+  small SiLU kernel and 23.34 -> 23.06 ms/step for strided GDN q/k/v.
+Cut-against: 0.31.0 with patches/series applied through qwen3_5-embed-uva.
+Retires-when: vLLM stops launching one CTA per token for small SiLU batches,
+  or the GDN spec path stops copying q/k/v before the recurrence.
+
+--- exported from 24bb68b (qwen3_5-small-batch-decode); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/model_executor/layers/activation.py b/model_executor/layers/activation.py
+index 808d6e7..467923e 100644
+--- a/model_executor/layers/activation.py
++++ b/model_executor/layers/activation.py
+@@ -18,6 +18,13 @@
+ logger = init_logger(__name__)
+ 
+ 
++import os as _os
++
++_QWEN27_SMALL_SILU = _os.environ.get("VLLM_QWEN27_SMALL_SILU", "1") == "1"
++if _QWEN27_SMALL_SILU:
++    import vllm.model_executor.layers.qwen27_small_ops  # noqa: F401
++
++
+ @triton.jit
+ def _swiglustep_and_mul_kernel(
+     o_ptr,
+@@ -147,6 +154,9 @@
+         d = x.shape[-1] // 2
+         output_shape = x.shape[:-1] + (d,)
+         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
++        if _QWEN27_SMALL_SILU and current_platform.is_cuda() and x.dim() == 2:
++            torch.ops.vllm.qwen27_silu_and_mul(out, x)
++            return out
+         self.op(out, x)
+         return out
+ 
+diff --git a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index 9d5bcc8..5c9fcc0 100644
+--- a/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -87,6 +87,7 @@
+ logger = init_logger(__name__)
+ 
+ MAX_FUSED_GDN_MTP_TOKENS = 8
++_QWEN27_STRIDED_QKV = __import__('os').environ.get('VLLM_QWEN27_STRIDED_QKV', '1') == '1'
+ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+ 
+ 
+@@ -1380,7 +1381,15 @@
+         else:
+             mixed_qkv_non_spec = None
+ 
+-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
++        if mixed_qkv_spec is not None and _QWEN27_STRIDED_QKV and mixed_qkv_spec.stride(-1) == 1:
++            # The spec path's only consumer takes per-token strides, so hand it
++            # column views instead of 3 reshape copies plus a concat.
++            _qd, _kd = self.key_dim // self.tp_size, self.key_dim // self.tp_size
++            query_spec = mixed_qkv_spec[:, :_qd].unflatten(-1, (-1, self.head_k_dim)).unsqueeze(0)
++            key_spec = mixed_qkv_spec[:, _qd:_qd + _kd].unflatten(-1, (-1, self.head_k_dim)).unsqueeze(0)
++            value_spec = mixed_qkv_spec[:, _qd + _kd:].unflatten(-1, (-1, self.head_v_dim)).unsqueeze(0)
++        else:
++            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+ 
+         # Split mixed non-spec-decode+prefill to process independently
+         split_non_spec = (
+diff --git a/model_executor/layers/qwen27_small_ops.py b/model_executor/layers/qwen27_small_ops.py
+new file mode 100644
+index 0000000..aee42fe
+--- /dev/null
++++ b/model_executor/layers/qwen27_small_ops.py
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small-batch replacements for launch-shaped decode kernels.
++
++silu_and_mul: vLLM's act_and_mul_kernel launches one CTA per token, i.e. 8
++CTAs at a verify step on an 82-SM 3090 (~5 us for <1 MB of data, 69 calls per
++step). This Triton kernel spreads each row over 1024-wide chunks. Rounding
++matches the CUDA kernel: silu in fp32, rounded to the activation dtype, then
++the product in fp32 rounded once. Larger batches (prefill) keep the stock op;
++the choice is made at run time inside the custom op, so the compiled graph has
++no shape branch.
++
++Ported from TheRealBluesun/HyperQwen-3090ti at 1199731.
++"""
++import torch
++
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++SMALL_TOKENS = 64
++
++
++@triton.jit
++def _silu_mul_kernel(x_ptr, out_ptr, d, stride_x, stride_o, BLOCK: tl.constexpr):
++    t = tl.program_id(0)
++    j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    m = j < d
++    g = tl.load(x_ptr + t * stride_x + j, mask=m, other=0.0).to(tl.float32)
++    u = tl.load(x_ptr + t * stride_x + d + j, mask=m, other=0.0)
++    s = (g / (1.0 + tl.exp(-g))).to(u.dtype)
++    tl.store(out_ptr + t * stride_o + j,
++             (s.to(tl.float32) * u.to(tl.float32)).to(u.dtype), mask=m)
++
++
++def _silu_and_mul_impl(out: torch.Tensor, x: torch.Tensor) -> None:
++    n = x.numel() // x.shape[-1]
++    if (
++        n > SMALL_TOKENS
++        or x.dtype != torch.bfloat16
++        or x.stride(-1) != 1
++        or out.stride(-1) != 1
++        or x.dim() != 2
++    ):
++        torch.ops._C.silu_and_mul(out, x)
++        return
++    d = x.shape[-1] // 2
++    BLOCK = 1024
++    _silu_mul_kernel[(n, triton.cdiv(d, BLOCK))](
++        x, out, d, x.stride(0), out.stride(0), BLOCK=BLOCK, num_warps=4)
++
++
++def _silu_and_mul_fake(out: torch.Tensor, x: torch.Tensor) -> None:
++    return
++
++
+diff --git a/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py b/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+index 261beff..1aa173d 100644
+--- a/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
++++ b/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+@@ -51,6 +51,9 @@
+     stride_final_state_token: tl.constexpr,
+     stride_indices_seq: tl.constexpr,
+     stride_indices_tok: tl.constexpr,
++    stride_qt,  # per-token strides of q/k/v (contiguous H*K, H*K, HV*V otherwise)
++    stride_kt,
++    stride_vt,
+     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
+     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
+     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+@@ -80,9 +83,9 @@
+     o_k = i_k * BK + tl.arange(0, BK)
+     o_v = i_v * BV + tl.arange(0, BV)
+ 
+-    p_q = q + (bos * H + i_h) * K + o_k
+-    p_k = k + (bos * H + i_h) * K + o_k
+-    p_v = v + (bos * HV + i_hv) * V + o_v
++    p_q = q + bos * stride_qt + i_h * K + o_k
++    p_k = k + bos * stride_kt + i_h * K + o_k
++    p_v = v + bos * stride_vt + i_hv * V + o_v
+ 
+     p_A_log = A_log + i_hv
+     if not IS_KDA:
+@@ -187,10 +190,10 @@
+             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+ 
+         # Update pointers for next timestep
+-        p_q += H * K
+-        p_k += H * K
++        p_q += stride_qt
++        p_k += stride_kt
+         p_o += HV * V
+-        p_v += HV * V
++        p_v += stride_vt
+         p_b += HV
+         p_a += HV
+ 
+@@ -256,6 +259,16 @@
+         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+ 
+     grid = (NK, NV, N * HV)
++    # q/k/v may be column views of the conv output (varlen, batch 1): each
++    # token's heads are contiguous, the token stride is not. Anything else gets
++    # the old contiguous copies.
++    def _tok_strided(x, h, d):
++        return x.dim() == 4 and x.shape[0] == 1 and x.stride(3) == 1 and x.stride(2) == d
++    if cu_seqlens is not None and _tok_strided(q, H, K) and _tok_strided(k, H, K) and _tok_strided(v, HV, V):
++        stride_qt, stride_kt, stride_vt = q.stride(1), k.stride(1), v.stride(1)
++    else:
++        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
++        stride_qt, stride_kt, stride_vt = H * K, H * K, HV * V
+     fused_sigmoid_gating_delta_rule_update_kernel[grid](
+         A_log=A_log,
+         a=a.contiguous(),
+@@ -263,9 +276,9 @@
+         dt_bias=dt_bias,
+         beta=beta,
+         threshold=threshold,
+-        q=q.contiguous(),
+-        k=k.contiguous(),
+-        v=v.contiguous(),
++        q=q,
++        k=k,
++        v=v,
+         o=o,
+         h0=initial_state,
+         ht=final_state,
+@@ -286,6 +299,9 @@
+         stride_final_state_token=stride_final_state_token,
+         stride_indices_seq=stride_indices_seq,
+         stride_indices_tok=stride_indices_tok,
++        stride_qt=stride_qt,
++        stride_kt=stride_kt,
++        stride_vt=stride_vt,
+         INPLACE_FINAL_STATE=inplace_final_state,
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+         IS_KDA=is_kda,

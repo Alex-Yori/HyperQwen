@@ -83,6 +83,7 @@ none, and the `.sh` scripts ask `/v1/models`. The `.sh` measurements take `PORT`
 | `test_spec_decode_attn.py` | kernel test | GPU | 0 or 1 | The split-KV spec-decode attention against a reference. The timing rows are informational. |
 | `test_spec_decode_bigpool.py` | kernel test | GPU | 0 or 1. The fp8 part skips below sm89 or without the fp8 path. | int32 overflow in `_spec_attn_partial` on a large pool (#86). |
 | `test_spec_decode_fp8.py` | kernel test | GPU, sm89+ | 0 or 1. Skips below sm89 or without the fp8 path. | The fp8 path of the split-KV kernel. The timing rows are informational. |
+| `test_small_batch_decode.py` | kernel test | GPU, image | 0 or 1. Skips without CUDA or when `qwen3_5-small-batch-decode` is not applied. | The bf16 SiLU*up fast path and fp16 fallback against vLLM's stock CUDA op, and speculative GDN with strided q/k/v views against contiguous copies, bit for bit. |
 | `test_t4_battery.py` | test | CPU, bash | 0 or 1 | `t4_battery.py`'s dry-run plan, parsers, restart gate (on a fake `/proc`), verdict, and one run against a stub launcher. |
 | `tune_gdn.py` | measurement | GPU | 0 | The Gated DeltaNet decode kernel over block sizes and warp counts. |
 | `verbatim.py` | library and test | CPU | 0 or 1 | How much of an answer copies its source. The two sweeps use it. Run alone, it tests itself. |
